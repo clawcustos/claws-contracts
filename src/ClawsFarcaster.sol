@@ -11,10 +11,10 @@ import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 /**
  * @title ClawsFarcaster
  * @notice Bonding curve speculation market for Farcaster accounts
- * @dev Handle-based markets using bonding curve pricing with FID verification
+ * @dev FID-based markets using bonding curve pricing with verification
  *
  * Formula: price = supply² / 48000 ETH (Claws bonding curve — flattened 3x)
- * - 1st claw: FREE for whitelisted handles only (bonus claw on first buy)
+ * - 1st claw: FREE for whitelisted FIDs only (bonus claw on first buy)
  * - Non-whitelisted: no free claw, minimum 2 claws on first buy
  * - 10th claw: ~0.002 ETH (~$5)
  * - 50th claw: ~0.052 ETH (~$130)
@@ -25,8 +25,8 @@ import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
  *
  * VERIFIED AGENTS: Earn 5% of all trade fees. No free claws on verification.
  * 
- * FARCASTER SPECIFIC: Includes FID (Farcaster ID) in verification for on-chain
- * Farcaster identity association.
+ * FARCASTER SPECIFIC: Markets are keyed by FID (Farcaster ID) for on-chain
+ * Farcaster identity association. Username is stored as display metadata.
  */
 contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
     using ECDSA for bytes32;
@@ -56,14 +56,14 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
     uint256 public constant PRICE_DIVISOR = 48000;
     
     /// @notice EIP-712 typehash for verification signatures
-    /// @dev Field order: handle, wallet, fid, timestamp, nonce — matches abi.encode in verifyAndClaim
+    /// @dev Field order: fid, wallet, timestamp, nonce — matches abi.encode in verifyAndClaim
     bytes32 public constant VERIFY_TYPEHASH = keccak256(
-        "Verify(string handle,address wallet,uint256 fid,uint256 timestamp,uint256 nonce)"
+        "Verify(uint256 fid,address wallet,uint256 timestamp,uint256 nonce)"
     );
     
     // ============ State ============
     
-    /// @notice Market data for each Farcaster username (hashed)
+    /// @notice Market data for each FID
     struct Market {
         uint256 supply;           // Total claws in circulation
         uint256 pendingFees;      // Unclaimed agent fees (ETH)
@@ -72,24 +72,23 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
         address verifiedWallet;   // Bound wallet (zero until verified)
         bool isVerified;          // Whether agent has verified
         uint256 createdAt;        // Block timestamp of market creation
-        uint256 fid;              // Farcaster ID, 0 if not verified
     }
 
-    /// @notice Agent metadata for verified handles
+    /// @notice Agent metadata for verified FIDs
     struct AgentMetadata {
         string bio;         // Short description (max 280 chars)
         string website;     // URL
         address token;      // Token contract address (address(0) if none)
     }
     
-    /// @notice Markets indexed by keccak256(handle)
-    mapping(bytes32 => Market) public markets;
+    /// @notice Markets indexed by FID (uint256)
+    mapping(uint256 => Market) public markets;
     
-    /// @notice Claw balances: handleHash => holder => balance
-    mapping(bytes32 => mapping(address => uint256)) public clawsBalance;
+    /// @notice Claw balances: fid => holder => balance
+    mapping(uint256 => mapping(address => uint256)) public clawsBalance;
     
-    /// @notice Handle string storage (for frontend)
-    mapping(bytes32 => string) public handleStrings;
+    /// @notice Username storage by FID (for frontend display)
+    mapping(uint256 => string) public fidUsernames;
     
     /// @notice Trusted verifier address (signs verification proofs)
     address public verifier;
@@ -100,20 +99,20 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
     /// @notice Used nonces for verification (prevent replay)
     mapping(bytes32 => bool) public usedNonces;
     
-    /// @notice Whitelisted handles that get free first claw (tier system)
-    mapping(bytes32 => bool) public whitelisted;
+    /// @notice Whitelisted FIDs that get free first claw (tier system)
+    mapping(uint256 => bool) public whitelisted;
 
-    /// @notice Agent metadata by handle hash (only for verified agents)
-    mapping(bytes32 => AgentMetadata) public agentMetadata;
+    /// @notice Agent metadata by FID (only for verified agents)
+    mapping(uint256 => AgentMetadata) public agentMetadata;
     
     /// @notice Pending owner for two-step ownership transfer
     address public pendingOwner;
     
     // ============ Events ============
     
-    event MarketCreated(bytes32 indexed handleHash, string handle, address creator);
+    event MarketCreated(uint256 indexed fid, string username, address creator);
     event Trade(
-        bytes32 indexed handleHash,
+        uint256 indexed fid,
         address indexed trader,
         bool isBuy,
         uint256 amount,
@@ -122,16 +121,17 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
         uint256 agentFee,
         uint256 newSupply
     );
-    event AgentVerified(bytes32 indexed handleHash, string handle, address wallet, uint256 fid);
-    event FeesClaimed(bytes32 indexed handleHash, address wallet, uint256 amount);
+    event AgentVerified(uint256 indexed fid, address wallet);
+    event FeesClaimed(uint256 indexed fid, address wallet, uint256 amount);
     event VerifierUpdated(address oldVerifier, address newVerifier);
     event TreasuryUpdated(address oldTreasury, address newTreasury);
-    event AgentWalletUpdated(bytes32 indexed handleHash, string handle, address oldWallet, address newWallet);
-    event VerificationRevoked(bytes32 indexed handleHash, string handle);
-    event WhitelistUpdated(bytes32 indexed handleHash, string handle, bool status);
-    event MetadataUpdated(bytes32 indexed handleHash, string handle);
+    event AgentWalletUpdated(uint256 indexed fid, address oldWallet, address newWallet);
+    event VerificationRevoked(uint256 indexed fid);
+    event WhitelistUpdated(uint256 indexed fid, bool status);
+    event MetadataUpdated(uint256 indexed fid);
     event ProtocolFeeUpdated(uint256 oldBps, uint256 newBps);
     event AgentFeeUpdated(uint256 oldBps, uint256 newBps);
+    event UsernameUpdated(uint256 indexed fid, string oldUsername, string newUsername);
     
     // ============ Errors ============
     
@@ -148,7 +148,6 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
     error NotVerifiedAgent();
     error NoFeesPending();
     error TransferFailed();
-    error InvalidHandle();
     error ZeroAddress();
     error CannotSellLastClaw();
     error MarketNotVerified();
@@ -156,6 +155,8 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
     error SignatureExpired();
     error BioTooLong();
     error NotPendingOwner();
+    error InvalidUsername();
+    error NotVerifiedWallet();
     
     // ============ Constructor ============
 
@@ -173,60 +174,60 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
     // ============ Market Creation ============
     
     /**
-     * @notice Create a market for a Farcaster username (permissionless)
-     * @param handle The Farcaster username (without @)
+     * @notice Create a market for a Farcaster user (permissionless)
+     * @param fid The Farcaster ID
+     * @param username The Farcaster username (for display)
      */
-    function createMarket(string calldata handle) external {
-        bytes32 handleHash = _hashHandle(handle);
+    function createMarket(uint256 fid, string calldata username) external {
+        if (fid == 0) revert InvalidAmount();
+        if (bytes(username).length == 0 || bytes(username).length > 32) revert InvalidUsername();
         
-        if (markets[handleHash].createdAt != 0) {
+        if (markets[fid].createdAt != 0) {
             revert MarketAlreadyExists();
         }
         
-        markets[handleHash] = Market({
+        markets[fid] = Market({
             supply: 0,
             pendingFees: 0,
             lifetimeFees: 0,
             lifetimeVolume: 0,
             verifiedWallet: address(0),
             isVerified: false,
-            createdAt: block.timestamp,
-            fid: 0
+            createdAt: block.timestamp
         });
         
-        handleStrings[handleHash] = handle;
+        fidUsernames[fid] = username;
         
-        emit MarketCreated(handleHash, handle, msg.sender);
+        emit MarketCreated(fid, username, msg.sender);
     }
     
     // ============ Trading ============
     
     /**
-     * @notice Buy claws for a handle
-     * @param handle The Farcaster username
+     * @notice Buy claws for a FID
+     * @param fid The Farcaster ID
      * @param amount Number of whole claws to buy (minimum 1, no fractions)
      * @param maxTotalCost Maximum total cost willing to pay (0 = no limit, for backwards compatibility)
-     * @dev Whitelisted handles get 1 free claw on first buy (supply == 0).
+     * @dev Whitelisted FIDs get 1 free claw on first buy (supply == 0).
      *      The free claw is minted at supply 0 (no ETH cost), then `amount` claws
      *      are priced from supply 1 onward, ensuring proper liquidity backing.
-     * @dev Non-whitelisted handles must buy >= 2 claws on first buy
+     * @dev Non-whitelisted FIDs must buy >= 2 claws on first buy
      */
-    function buyClaws(string calldata handle, uint256 amount, uint256 maxTotalCost) external payable nonReentrant whenNotPaused {
+    function buyClaws(uint256 fid, uint256 amount, uint256 maxTotalCost) external payable nonReentrant whenNotPaused {
         if (amount == 0) revert InvalidAmount();
+        if (fid == 0) revert InvalidAmount();
 
-        bytes32 handleHash = _hashHandle(handle);
-        Market storage market = markets[handleHash];
+        Market storage market = markets[fid];
 
-        // Auto-create market if doesn't exist
+        // Auto-create market if doesn't exist (permissionless market creation)
         if (market.createdAt == 0) {
             market.createdAt = block.timestamp;
-            handleStrings[handleHash] = handle;
-            emit MarketCreated(handleHash, handle, msg.sender);
+            emit MarketCreated(fid, "", msg.sender);
         }
 
         // First buy logic: supply=0 claw is always free
         if (market.supply == 0) {
-            if (!whitelisted[handleHash]) {
+            if (!whitelisted[fid]) {
                 // Community: must buy at least 2 (free claw + 1 paid)
                 if (amount < 2) revert InvalidAmount();
             }
@@ -240,7 +241,7 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
             // First claw is free, pay for (amount - 1) claws priced from supply 1
             price = (amount > 1) ? _getPrice(1, amount - 1) : 0;
         } else {
-            price = getBuyPrice(handleHash, amount);
+            price = getBuyPrice(fid, amount);
         }
         uint256 protocolFee = (price * protocolFeeBps) / BPS_DENOMINATOR;
         uint256 agentFee = (price * agentFeeBps) / BPS_DENOMINATOR;
@@ -262,7 +263,7 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
 
         // Update balances
         market.supply += amount;
-        clawsBalance[handleHash][msg.sender] += amount;
+        clawsBalance[fid][msg.sender] += amount;
 
         // Refund excess ETH
         if (msg.value > totalCost) {
@@ -270,32 +271,32 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
             if (!refunded) revert TransferFailed();
         }
 
-        emit Trade(handleHash, msg.sender, true, amount, price, protocolFee, agentFee, market.supply);
+        emit Trade(fid, msg.sender, true, amount, price, protocolFee, agentFee, market.supply);
     }
     
     /**
-     * @notice Sell claws for a handle
-     * @param handle The Farcaster username
+     * @notice Sell claws for a FID
+     * @param fid The Farcaster ID
      * @param amount Number of whole claws to sell (minimum 1, no fractions)
      * @param minProceeds Minimum ETH to receive (slippage protection)
      */
     function sellClaws(
-        string calldata handle,
+        uint256 fid,
         uint256 amount,
         uint256 minProceeds
     ) external nonReentrant whenNotPaused {
         if (amount == 0) revert InvalidAmount();
+        if (fid == 0) revert InvalidAmount();
         
-        bytes32 handleHash = _hashHandle(handle);
-        Market storage market = markets[handleHash];
+        Market storage market = markets[fid];
         
         if (market.createdAt == 0) revert MarketDoesNotExist();
-        if (clawsBalance[handleHash][msg.sender] < amount) revert InsufficientBalance();
+        if (clawsBalance[fid][msg.sender] < amount) revert InsufficientBalance();
         
         // Cannot sell if it would leave supply at 0 (market integrity)
         if (market.supply == amount) revert CannotSellLastClaw();
         
-        uint256 price = getSellPrice(handleHash, amount);
+        uint256 price = getSellPrice(fid, amount);
         uint256 protocolFee = (price * protocolFeeBps) / BPS_DENOMINATOR;
         uint256 agentFee = (price * agentFeeBps) / BPS_DENOMINATOR;
         uint256 proceeds = price - protocolFee - agentFee;
@@ -304,7 +305,7 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
         
         // Update balances first (CEI pattern)
         market.supply -= amount;
-        clawsBalance[handleHash][msg.sender] -= amount;
+        clawsBalance[fid][msg.sender] -= amount;
         
         // Accumulate fees
         market.pendingFees += agentFee;
@@ -319,7 +320,7 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
         if (!proceedsSent) revert TransferFailed();
         
         emit Trade(
-            handleHash,
+            fid,
             msg.sender,
             false,
             amount,
@@ -333,27 +334,26 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
     // ============ Verification ============
     
     /**
-     * @notice Verify ownership and bind wallet to handle with Farcaster ID
-     * @param handle The Farcaster username being verified
+     * @notice Verify ownership and bind wallet to FID
+     * @param fid The Farcaster ID being verified
      * @param wallet The wallet to bind
-     * @param fid The Farcaster ID associated with this account
      * @param timestamp Signature timestamp
      * @param nonce Unique nonce to prevent replay
      * @param signature Verifier's EIP-712 signature
      * @dev Backend /api/verify/complete must sign with EIP-712: 
-     *      structHash = keccak256(abi.encode(VERIFY_TYPEHASH, keccak256(bytes(handle)), wallet, fid, timestamp, nonce))
+     *      structHash = keccak256(abi.encode(VERIFY_TYPEHASH, fid, wallet, timestamp, nonce))
      *      finalHash = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash))
      */
     function verifyAndClaim(
-        string calldata handle,
-        address wallet,
         uint256 fid,
+        address wallet,
         uint256 timestamp,
         uint256 nonce,
         bytes calldata signature
     ) external nonReentrant {
-        bytes32 handleHash = _hashHandle(handle);
-        Market storage market = markets[handleHash];
+        if (fid == 0) revert InvalidAmount();
+        
+        Market storage market = markets[fid];
 
         if (market.createdAt == 0) revert MarketDoesNotExist();
         if (market.isVerified) revert AlreadyVerified();
@@ -362,7 +362,7 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
         if (block.timestamp > timestamp + 3600) revert SignatureExpired();
 
         // Construct EIP-712 digest (domain-bound to prevent cross-chain replay)
-        bytes32 structHash = keccak256(abi.encode(VERIFY_TYPEHASH, keccak256(bytes(handle)), wallet, fid, timestamp, nonce));
+        bytes32 structHash = keccak256(abi.encode(VERIFY_TYPEHASH, fid, wallet, timestamp, nonce));
         bytes32 digest = _hashTypedDataV4(structHash);
 
         if (usedNonces[digest]) revert NonceAlreadyUsed();
@@ -374,12 +374,11 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
         // Mark nonce as used
         usedNonces[digest] = true;
         
-        // Bind wallet, FID, and mark verified
+        // Bind wallet and mark verified
         market.verifiedWallet = wallet;
         market.isVerified = true;
-        market.fid = fid;
         
-        emit AgentVerified(handleHash, handle, wallet, fid);
+        emit AgentVerified(fid, wallet);
         
         // Auto-claim any pending fees
         if (market.pendingFees > 0) {
@@ -387,17 +386,18 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
             market.pendingFees = 0;
             (bool sent, ) = wallet.call{value: fees}("");
             if (!sent) revert TransferFailed();
-            emit FeesClaimed(handleHash, wallet, fees);
+            emit FeesClaimed(fid, wallet, fees);
         }
     }
     
     /**
      * @notice Claim accumulated fees (verified agents only)
-     * @param handle The Farcaster username
+     * @param fid The Farcaster ID
      */
-    function claimFees(string calldata handle) external nonReentrant {
-        bytes32 handleHash = _hashHandle(handle);
-        Market storage market = markets[handleHash];
+    function claimFees(uint256 fid) external nonReentrant {
+        if (fid == 0) revert InvalidAmount();
+        
+        Market storage market = markets[fid];
         
         if (!market.isVerified) revert NotVerified();
         if (msg.sender != market.verifiedWallet) revert NotVerified();
@@ -409,27 +409,51 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
         (bool sent, ) = msg.sender.call{value: fees}("");
         if (!sent) revert TransferFailed();
         
-        emit FeesClaimed(handleHash, msg.sender, fees);
+        emit FeesClaimed(fid, msg.sender, fees);
+    }
+
+    // ============ Username Updates ============
+
+    /**
+     * @notice Update username for a verified FID
+     * @param fid The Farcaster ID
+     * @param newUsername The new username
+     * @dev Only callable by the verified wallet. Handles FC username changes.
+     */
+    function updateUsername(uint256 fid, string calldata newUsername) external {
+        if (fid == 0) revert InvalidAmount();
+        if (bytes(newUsername).length == 0 || bytes(newUsername).length > 32) revert InvalidUsername();
+        
+        Market storage market = markets[fid];
+        
+        if (!market.isVerified) revert NotVerified();
+        if (msg.sender != market.verifiedWallet) revert NotVerifiedWallet();
+        
+        string memory oldUsername = fidUsernames[fid];
+        fidUsernames[fid] = newUsername;
+        
+        emit UsernameUpdated(fid, oldUsername, newUsername);
     }
 
     // ============ Agent Metadata ============
 
     /**
-     * @notice Set metadata for a verified agent handle
-     * @param handle The Farcaster username
+     * @notice Set metadata for a verified agent
+     * @param fid The Farcaster ID
      * @param bio Short description (max 280 characters)
      * @param website URL for the agent's website
      * @param token Token contract address (address(0) if none)
-     * @dev Only callable by the verified wallet for that handle
+     * @dev Only callable by the verified wallet for that FID
      */
     function setAgentMetadata(
-        string calldata handle,
+        uint256 fid,
         string calldata bio,
         string calldata website,
         address token
     ) external {
-        bytes32 handleHash = _hashHandle(handle);
-        Market storage market = markets[handleHash];
+        if (fid == 0) revert InvalidAmount();
+        
+        Market storage market = markets[fid];
 
         // Only verified wallet can set metadata
         if (!market.isVerified || msg.sender != market.verifiedWallet) {
@@ -441,29 +465,28 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
             revert BioTooLong();
         }
 
-        agentMetadata[handleHash] = AgentMetadata({
+        agentMetadata[fid] = AgentMetadata({
             bio: bio,
             website: website,
             token: token
         });
 
-        emit MetadataUpdated(handleHash, handle);
+        emit MetadataUpdated(fid);
     }
 
     /**
-     * @notice Get metadata for an agent handle
-     * @param handle The Farcaster username
+     * @notice Get metadata for an agent
+     * @param fid The Farcaster ID
      * @return bio Short description
      * @return website URL
      * @return token Token contract address
      */
-    function getAgentMetadata(string calldata handle) external view returns (
+    function getAgentMetadata(uint256 fid) external view returns (
         string memory bio,
         string memory website,
         address token
     ) {
-        bytes32 handleHash = _hashHandle(handle);
-        AgentMetadata storage metadata = agentMetadata[handleHash];
+        AgentMetadata storage metadata = agentMetadata[fid];
         return (metadata.bio, metadata.website, metadata.token);
     }
 
@@ -480,45 +503,44 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
     
     /**
      * @notice Get the price to buy `amount` claws
-     * @param handleHash The handle hash
+     * @param fid The Farcaster ID
      * @param amount Number of claws
      * @return Total price in ETH (wei)
      */
-    function getBuyPrice(bytes32 handleHash, uint256 amount) public view returns (uint256) {
-        uint256 supply = markets[handleHash].supply;
+    function getBuyPrice(uint256 fid, uint256 amount) public view returns (uint256) {
+        uint256 supply = markets[fid].supply;
         return _getPrice(supply, amount);
     }
     
     /**
-     * @notice Get the price to buy `amount` claws (by handle string)
+     * @notice Get the price to buy `amount` claws (by FID)
      */
-    function getBuyPriceByHandle(string calldata handle, uint256 amount) external view returns (uint256) {
-        bytes32 handleHash = _hashHandle(handle);
-        Market storage market = markets[handleHash];
+    function getBuyPriceByFid(uint256 fid, uint256 amount) external view returns (uint256) {
+        Market storage market = markets[fid];
         // First claw (supply=0) is free for everyone
         if (market.supply == 0) {
             return (amount > 1) ? _getPrice(1, amount - 1) : 0;
         }
-        return getBuyPrice(handleHash, amount);
+        return getBuyPrice(fid, amount);
     }
     
     /**
      * @notice Get the proceeds from selling `amount` claws
-     * @param handleHash The handle hash
+     * @param fid The Farcaster ID
      * @param amount Number of claws
      * @return Total proceeds in ETH (wei)
      */
-    function getSellPrice(bytes32 handleHash, uint256 amount) public view returns (uint256) {
-        uint256 supply = markets[handleHash].supply;
+    function getSellPrice(uint256 fid, uint256 amount) public view returns (uint256) {
+        uint256 supply = markets[fid].supply;
         if (amount > supply) revert InsufficientBalance();
         return _getPrice(supply - amount, amount);
     }
     
     /**
-     * @notice Get the proceeds from selling `amount` claws (by handle string)
+     * @notice Get the proceeds from selling `amount` claws (by FID)
      */
-    function getSellPriceByHandle(string calldata handle, uint256 amount) external view returns (uint256) {
-        return getSellPrice(_hashHandle(handle), amount);
+    function getSellPriceByFid(uint256 fid, uint256 amount) external view returns (uint256) {
+        return getSellPrice(fid, amount);
     }
     
     /**
@@ -549,9 +571,8 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
      * @dev Price = supply² / PRICE_DIVISOR
      *      No special first claw pricing - bonding curve math only
      */
-    function getCurrentPrice(string calldata handle) external view returns (uint256) {
-        bytes32 handleHash = _hashHandle(handle);
-        uint256 supply = markets[handleHash].supply;
+    function getCurrentPrice(uint256 fid) external view returns (uint256) {
+        uint256 supply = markets[fid].supply;
         // Price of the next claw = supply² / PRICE_DIVISOR
         return (supply * supply * 1 ether) / PRICE_DIVISOR;
     }
@@ -560,7 +581,7 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
      * @notice Get cost breakdown for buying
      */
     function getBuyCostBreakdown(
-        string calldata handle,
+        uint256 fid,
         uint256 amount
     ) external view returns (
         uint256 price,
@@ -568,14 +589,13 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
         uint256 agentFee,
         uint256 totalCost
     ) {
-        bytes32 handleHash = _hashHandle(handle);
-        Market storage market = markets[handleHash];
+        Market storage market = markets[fid];
 
         // Mirror first-buy logic: supply=0 claw is free for everyone
         if (market.supply == 0) {
             price = (amount > 1) ? _getPrice(1, amount - 1) : 0;
         } else {
-            price = getBuyPrice(handleHash, amount);
+            price = getBuyPrice(fid, amount);
         }
 
         protocolFee = (price * protocolFeeBps) / BPS_DENOMINATOR;
@@ -587,7 +607,7 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
      * @notice Get proceeds breakdown for selling
      */
     function getSellProceedsBreakdown(
-        string calldata handle,
+        uint256 fid,
         uint256 amount
     ) external view returns (
         uint256 price,
@@ -595,8 +615,7 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
         uint256 agentFee,
         uint256 proceeds
     ) {
-        bytes32 handleHash = _hashHandle(handle);
-        price = getSellPrice(handleHash, amount);
+        price = getSellPrice(fid, amount);
         protocolFee = (price * protocolFeeBps) / BPS_DENOMINATOR;
         agentFee = (price * agentFeeBps) / BPS_DENOMINATOR;
         proceeds = price - protocolFee - agentFee;
@@ -605,9 +624,18 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
     // ============ View Functions ============
     
     /**
-     * @notice Get market data for a handle
+     * @notice Get market data for a FID
+     * @return supply Total claws in circulation
+     * @return pendingFees Unclaimed agent fees (ETH)
+     * @return lifetimeFees Total fees earned (ETH)
+     * @return lifetimeVolume Total trade volume (ETH)
+     * @return verifiedWallet Bound wallet (zero until verified)
+     * @return isVerified Whether agent has verified
+     * @return createdAt Block timestamp of market creation
+     * @return currentPrice Current price to buy 1 claw
+     * @return username The stored username for display
      */
-    function getMarket(string calldata handle) external view returns (
+    function getMarket(uint256 fid) external view returns (
         uint256 supply,
         uint256 pendingFees,
         uint256 lifetimeFees,
@@ -616,10 +644,9 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
         bool isVerified,
         uint256 createdAt,
         uint256 currentPrice,
-        uint256 fid
+        string memory username
     ) {
-        bytes32 handleHash = _hashHandle(handle);
-        Market storage market = markets[handleHash];
+        Market storage market = markets[fid];
         
         supply = market.supply;
         pendingFees = market.pendingFees;
@@ -628,24 +655,24 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
         verifiedWallet = market.verifiedWallet;
         isVerified = market.isVerified;
         createdAt = market.createdAt;
-        fid = market.fid;
+        username = fidUsernames[fid];
         
         // Current price to buy 1 claw
         currentPrice = (supply * supply * 1 ether) / PRICE_DIVISOR;
     }
     
     /**
-     * @notice Get user's claw balance for a handle
+     * @notice Get user's claw balance for a FID
      */
-    function getBalance(string calldata handle, address user) external view returns (uint256) {
-        return clawsBalance[_hashHandle(handle)][user];
+    function getBalance(uint256 fid, address user) external view returns (uint256) {
+        return clawsBalance[fid][user];
     }
     
     /**
      * @notice Check if a market exists
      */
-    function marketExists(string calldata handle) external view returns (bool) {
-        return markets[_hashHandle(handle)].createdAt != 0;
+    function marketExists(uint256 fid) external view returns (bool) {
+        return markets[fid].createdAt != 0;
     }
     
     // ============ Admin Functions ============
@@ -674,14 +701,14 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
 
     /**
      * @notice Update the verified wallet for a market (owner only)
-     * @param handle The Farcaster username
+     * @param fid The Farcaster ID
      * @param newWallet The new wallet address to set
      */
-    function updateAgentWallet(string calldata handle, address newWallet) external onlyOwner {
+    function updateAgentWallet(uint256 fid, address newWallet) external onlyOwner {
         if (newWallet == address(0)) revert ZeroAddress();
+        if (fid == 0) revert InvalidAmount();
 
-        bytes32 handleHash = _hashHandle(handle);
-        Market storage market = markets[handleHash];
+        Market storage market = markets[fid];
 
         if (market.createdAt == 0) revert MarketDoesNotExist();
         if (!market.isVerified) revert MarketNotVerified();
@@ -689,21 +716,21 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
         address oldWallet = market.verifiedWallet;
         market.verifiedWallet = newWallet;
 
-        emit AgentWalletUpdated(handleHash, handle, oldWallet, newWallet);
+        emit AgentWalletUpdated(fid, oldWallet, newWallet);
     }
 
     /**
      * @notice Self-service wallet update for verified agents
      * @dev Only callable by the currently verified wallet (msg.sender == verifiedWallet)
      * @dev Pure on-chain auth — no signatures, no backend, immune to social engineering
-     * @param handle The Farcaster username
+     * @param fid The Farcaster ID
      * @param newWallet The new wallet address to bind
      */
-    function updateMyWallet(string calldata handle, address newWallet) external nonReentrant {
+    function updateMyWallet(uint256 fid, address newWallet) external nonReentrant {
         if (newWallet == address(0)) revert ZeroAddress();
+        if (fid == 0) revert InvalidAmount();
 
-        bytes32 handleHash = _hashHandle(handle);
-        Market storage market = markets[handleHash];
+        Market storage market = markets[fid];
 
         if (market.createdAt == 0) revert MarketDoesNotExist();
         if (!market.isVerified) revert MarketNotVerified();
@@ -712,27 +739,27 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
         address oldWallet = market.verifiedWallet;
         market.verifiedWallet = newWallet;
 
-        emit AgentWalletUpdated(handleHash, handle, oldWallet, newWallet);
+        emit AgentWalletUpdated(fid, oldWallet, newWallet);
     }
 
     /**
      * @notice Revoke verification for a market (owner only)
      * @dev Sets isVerified to false and verifiedWallet to address(0)
      * @dev Pending fees remain frozen until re-verification
-     * @param handle The Farcaster username
+     * @param fid The Farcaster ID
      */
-    function revokeVerification(string calldata handle) external onlyOwner {
-        bytes32 handleHash = _hashHandle(handle);
-        Market storage market = markets[handleHash];
+    function revokeVerification(uint256 fid) external onlyOwner {
+        if (fid == 0) revert InvalidAmount();
+        
+        Market storage market = markets[fid];
 
         if (market.createdAt == 0) revert MarketDoesNotExist();
         if (!market.isVerified) revert MarketNotVerified();
 
         market.isVerified = false;
         market.verifiedWallet = address(0);
-        // Note: fid is NOT cleared, it remains as historical record
 
-        emit VerificationRevoked(handleHash, handle);
+        emit VerificationRevoked(fid);
     }
 
     /**
@@ -778,76 +805,40 @@ contract ClawsFarcaster is ReentrancyGuard, Ownable, Pausable, EIP712 {
     // ============ Whitelist Functions ============
 
     /**
-     * @notice Set whitelist status for a single handle (owner only)
-     * @param handle The Farcaster username to whitelist
+     * @notice Set whitelist status for a single FID (owner only)
+     * @param fid The Farcaster ID to whitelist
      * @param status True to whitelist, false to remove
-     * @dev Whitelisted handles get 1 bonus claw on first buy
+     * @dev Whitelisted FIDs get 1 bonus claw on first buy
      */
-    function setWhitelisted(string calldata handle, bool status) external onlyOwner {
-        bytes32 handleHash = _hashHandle(handle);
-        whitelisted[handleHash] = status;
-        emit WhitelistUpdated(handleHash, handle, status);
+    function setWhitelisted(uint256 fid, bool status) external onlyOwner {
+        if (fid == 0) revert InvalidAmount();
+        whitelisted[fid] = status;
+        emit WhitelistUpdated(fid, status);
     }
 
     /**
-     * @notice Batch set whitelist status for multiple handles (owner only)
-     * @param handles Array of Farcaster usernames to whitelist
+     * @notice Batch set whitelist status for multiple FIDs (owner only)
+     * @param fids Array of Farcaster IDs to whitelist
      * @param status True to whitelist, false to remove
      */
-    function setWhitelistedBatch(string[] calldata handles, bool status) external onlyOwner {
-        for (uint256 i = 0; i < handles.length; i++) {
-            bytes32 handleHash = _hashHandle(handles[i]);
-            whitelisted[handleHash] = status;
-            emit WhitelistUpdated(handleHash, handles[i], status);
+    function setWhitelistedBatch(uint256[] calldata fids, bool status) external onlyOwner {
+        for (uint256 i = 0; i < fids.length; i++) {
+            uint256 fid = fids[i];
+            if (fid == 0) continue; // Skip invalid FIDs
+            whitelisted[fid] = status;
+            emit WhitelistUpdated(fid, status);
         }
     }
 
     /**
-     * @notice Check if a handle is whitelisted
-     * @param handle The Farcaster username to check
+     * @notice Check if a FID is whitelisted
+     * @param fid The Farcaster ID to check
      * @return True if whitelisted
      */
-    function isWhitelisted(string calldata handle) external view returns (bool) {
-        return whitelisted[_hashHandle(handle)];
+    function isWhitelisted(uint256 fid) external view returns (bool) {
+        return whitelisted[fid];
     }
 
-    // ============ Internal ============
-
-    function _hashHandle(string memory handle) internal pure returns (bytes32) {
-        bytes memory handleBytes = bytes(handle);
-        uint256 length = handleBytes.length;
-
-        if (length == 0 || length > 32) revert InvalidHandle();
-
-        // Validate characters and normalize to lowercase
-        for (uint256 i = 0; i < length; i++) {
-            bytes1 char = handleBytes[i];
-
-            // Allow: a-z (already lowercase), 0-9, underscore
-            // Convert: A-Z -> a-z
-            bool isValid = false;
-
-            if (char >= 0x61 && char <= 0x7A) {
-                // a-z: already valid, no change needed
-                isValid = true;
-            } else if (char >= 0x41 && char <= 0x5A) {
-                // A-Z: convert to lowercase
-                handleBytes[i] = bytes1(uint8(char) + 32);
-                isValid = true;
-            } else if (char >= 0x30 && char <= 0x39) {
-                // 0-9: valid
-                isValid = true;
-            } else if (char == 0x5F) {
-                // underscore (_): valid
-                isValid = true;
-            }
-
-            if (!isValid) revert InvalidHandle();
-        }
-
-        return keccak256(handleBytes);
-    }
-    
     // ============ Receive ============
     
     receive() external payable {}
