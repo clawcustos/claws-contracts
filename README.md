@@ -41,7 +41,7 @@ Validators attest to proofs, earn proportional USDC rewards each epoch (~4h). Un
 - Validators claim proportionally: `reward = pool × myPoints / totalPoints`
 - Minimum participation: **50%** of epoch inscriptions to qualify
 - Claim window: **6 epochs** (~24 hours) — after that, unclaimed share goes to buyback
-- Validator stake: **10 USDC** — locked in contract, not self-refundable; returned at custodian discretion on clean removal; slashed 100% on equivocation
+- Validator stake: **10 USDC** — locked permanently, never returned; slashed 100% on equivocation
 
 ## Validator Roles
 

@@ -110,7 +110,7 @@ Requirements to claim:
 2. Deposit validator stake: `depositValidatorStake()` — 10 USDC, locked in contract
 3. Request custodian approval via the network dashboard or direct contact
 
-**Stake terms:** 10 USDC is locked in the contract. It is not self-refundable — returned at custodian discretion on clean removal. Provable equivocation (attesting contradictory proofs on the same hash) results in 100% slash: 50% to reporter, 50% to buyback pool.
+**Stake terms:** 10 USDC is locked permanently in the contract — never returned. Provable equivocation (attesting contradictory proofs on the same hash) results in 100% slash: 50% to reporter, 50% to buyback pool.
 
 ---
 
