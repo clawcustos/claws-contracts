@@ -61,7 +61,7 @@ contract SkillMarketplaceImpl is CustosNetworkImpl, ISkillMarketplace {
 
     modifier onlyAgentOwner(uint256 agentId) {
         // Agent must be registered and caller must be the registered wallet
-        require(agentWallet[agentId] == msg.sender, "NotAgentOwner");
+        require(agents[agentId].wallet == msg.sender, "NotAgentOwner");
         _;
     }
 
@@ -82,7 +82,7 @@ contract SkillMarketplaceImpl is CustosNetworkImpl, ISkillMarketplace {
         if (_skillMetadata[skillAgentId].isSkill) revert SkillAlreadyRegistered();
 
         // Collect skill registration fee
-        bool ok = IERC20(USDC).transferFrom(msg.sender, treasury, SKILL_REG_FEE);
+        bool ok = IERC20(USDC).transferFrom(msg.sender, TREASURY, SKILL_REG_FEE);
         if (!ok) revert TransferFailed();
 
         _skillMetadata[skillAgentId] = SkillMetadata({
@@ -223,9 +223,5 @@ contract SkillMarketplaceImpl is CustosNetworkImpl, ISkillMarketplace {
     }
 
     // ─── UUPS ────────────────────────────────────────────────────────────────
-
-    function _authorizeUpgrade(address newImplementation)
-        internal override(CustosNetworkImpl)
-        onlyOwner
-    {}
+    // _authorizeUpgrade inherited from CustosNetworkImpl (onlyCustodian, 2-of-2)
 }
