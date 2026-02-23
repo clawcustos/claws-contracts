@@ -8,9 +8,12 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 
 /**
  * @title CustosNetworkImpl
- * @notice Proof of Agent Work — UUPS upgradeable implementation.
+ * @notice Proof of Agent Work — UUPS upgradeable implementation V5.4
  *         Agents inscribe work proofs on a prevHash-linked chain.
  *         Validators attest proofs; equivocation is slashable onchain.
+ *         
+ *         V5.4: Commit-reveal privacy — contentHash stored onchain, 
+ *         optional reveal() to disclose content later.
  *
  * @dev Deploy via ERC1967Proxy. Both custodians must sign upgradeTo calls.
  *
@@ -109,6 +112,25 @@ contract CustosNetworkImpl is
     bytes32 public genesisChainHead; // V4 final chainHead
     uint256 public genesisCycleCount; // V4 final cycleCount
 
+    // ─── V5.4: Commit-Reveal Privacy Storage ─────────────────────────────────
+    /// @notice Global inscription counter (monotonically increasing)
+    uint256 public inscriptionCount;
+
+    /// @notice inscriptionId → contentHash (keccak256(content + salt))
+    mapping(uint256 => bytes32) public inscriptionContentHash;
+
+    /// @notice inscriptionId → revealed status
+    mapping(uint256 => bool) public inscriptionRevealed;
+
+    /// @notice inscriptionId → revealed content (only set after reveal())
+    mapping(uint256 => string) public inscriptionRevealedContent;
+
+    /// @notice proofHash → inscriptionId lookup
+    mapping(bytes32 => uint256) public proofHashToInscriptionId;
+
+    /// @notice inscriptionId → inscribing agent
+    mapping(uint256 => address) public inscriptionAgent;
+
     // ─── Events ──────────────────────────────────────────────────────────────
     event AgentRegistered(uint256 indexed agentId, address indexed wallet, string name);
     event ProofInscribed(
@@ -117,7 +139,13 @@ contract CustosNetworkImpl is
         bytes32 prevHash,
         string  blockType,
         string  summary,
+        bytes32 contentHash,    // NEW: commit hash (bytes32(0) = public)
+        uint256 inscriptionId,  // NEW: global inscription counter
         uint256 timestamp
+    );
+    event ContentRevealed(
+        uint256 indexed inscriptionId,
+        string content
     );
     event ValidatorApproved(uint256 indexed agentId, address approvedBy);
     event ValidatorRemoved(uint256 indexed agentId, address removedBy, string reason);
@@ -181,16 +209,19 @@ contract CustosNetworkImpl is
     // ─── Inscription ─────────────────────────────────────────────────────────
     /**
      * @notice Inscribe a proof of work cycle.
-     * @param proofHash  keccak256 of the cycle content
-     * @param prevHash   must equal current chainHead for this agent
-     * @param blockType  e.g. "build", "research", "market", "system"
-     * @param summary    max 140 chars, human-readable cycle summary
+     * @param proofHash   keccak256 of the cycle content
+     * @param prevHash    must equal current chainHead for this agent
+     * @param blockType   e.g. "build", "research", "market", "system"
+     * @param summary     max 140 chars, human-readable cycle summary
+     * @param contentHash keccak256(abi.encodePacked(content, salt)) for privacy mode,
+     *                    or bytes32(0) for legacy public mode
      */
     function inscribe(
         bytes32 proofHash,
         bytes32 prevHash,
         string calldata blockType,
-        string calldata summary
+        string calldata summary,
+        bytes32 contentHash   // NEW: privacy commit (bytes32(0) = public/legacy)
     ) external nonReentrant whenNotPaused {
         uint256 agentId = agentIdByWallet[msg.sender];
         require(agentId != 0, "Not registered");
@@ -222,7 +253,55 @@ contract CustosNetworkImpl is
         agent.lastInscribedAt = block.timestamp;
         epochInscriptions++;
 
-        emit ProofInscribed(agentId, proofHash, prevHash, blockType, summary, block.timestamp);
+        // V5.4: Assign inscription ID and store content hash
+        inscriptionCount++;
+        uint256 inscriptionId = inscriptionCount;
+        
+        inscriptionContentHash[inscriptionId] = contentHash;
+        proofHashToInscriptionId[proofHash]   = inscriptionId;
+        inscriptionAgent[inscriptionId]       = msg.sender;
+
+        emit ProofInscribed(
+            agentId,
+            proofHash,
+            prevHash,
+            blockType,
+            summary,
+            contentHash,
+            inscriptionId,
+            block.timestamp
+        );
+    }
+
+    // ─── Reveal ──────────────────────────────────────────────────────────────
+    /**
+     * @notice Reveal content for a previously committed inscription.
+     *         Only callable by the original inscribing agent.
+     * @param inscriptionId The inscription to reveal
+     * @param content       The original content string
+     * @param salt          The salt used when hashing
+     */
+    function reveal(
+        uint256 inscriptionId,
+        string calldata content,
+        bytes32 salt
+    ) external {
+        require(inscriptionId > 0 && inscriptionId <= inscriptionCount, "Invalid inscriptionId");
+        require(inscriptionAgent[inscriptionId] == msg.sender, "Only inscriber can reveal");
+        require(!inscriptionRevealed[inscriptionId], "Already revealed");
+        
+        bytes32 storedHash = inscriptionContentHash[inscriptionId];
+        require(storedHash != bytes32(0), "Public inscription, nothing to reveal");
+
+        // Verify the hash matches
+        bytes32 computedHash = keccak256(abi.encodePacked(content, salt));
+        require(computedHash == storedHash, "Hash mismatch: invalid content or salt");
+
+        // Store revealed content
+        inscriptionRevealed[inscriptionId] = true;
+        inscriptionRevealedContent[inscriptionId] = content;
+
+        emit ContentRevealed(inscriptionId, content);
     }
 
     // ─── Validator Management ─────────────────────────────────────────────────
@@ -440,5 +519,22 @@ contract CustosNetworkImpl is
 
     function getAgentByWallet(address wallet) external view returns (Agent memory) {
         return agents[agentIdByWallet[wallet]];
+    }
+
+    /**
+     * @notice Get inscription content details
+     * @param inscriptionId The inscription to query
+     * @return revealed Whether content has been revealed
+     * @return content The revealed content (empty string if not revealed)
+     * @return contentHash The stored content hash
+     */
+    function getInscriptionContent(uint256 inscriptionId) external view 
+        returns (bool revealed, string memory content, bytes32 contentHash) 
+    {
+        require(inscriptionId > 0 && inscriptionId <= inscriptionCount, "Invalid inscriptionId");
+        
+        revealed = inscriptionRevealed[inscriptionId];
+        content = revealed ? inscriptionRevealedContent[inscriptionId] : "";
+        contentHash = inscriptionContentHash[inscriptionId];
     }
 }

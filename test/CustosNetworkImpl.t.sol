@@ -119,11 +119,11 @@ contract CustosNetworkImplTest is Test {
         network.registerAgent("TestAgent2");
     }
 
-    // Helper: warp past rate limit then inscribe
+    // Helper: warp past rate limit then inscribe (using legacy public mode)
     function _inscribe(address agent, bytes32 proof, bytes32 prev, string memory summary) internal {
         vm.warp(block.timestamp + 11 minutes);
         vm.prank(agent);
-        network.inscribe(proof, prev, "build", summary);
+        network.inscribe(proof, prev, "build", summary, bytes32(0)); // bytes32(0) = public mode
     }
 
     // ─── Inscription ────────────────────────────────────────────────────────
@@ -165,7 +165,7 @@ contract CustosNetworkImplTest is Test {
         // Immediately (no warp) — should rate limit
         vm.prank(agent1);
         vm.expectRevert("Rate limited");
-        network.inscribe(proof2, proof1, "build", "too soon");
+        network.inscribe(proof2, proof1, "build", "too soon", bytes32(0));
     }
 
     function test_WrongPrevHashReverts() public {
@@ -178,7 +178,7 @@ contract CustosNetworkImplTest is Test {
         vm.warp(block.timestamp + 11 minutes);
         vm.prank(agent1);
         vm.expectRevert("Chain break: wrong prevHash");
-        network.inscribe(proof, wrongPrev, "build", "bad chain");
+        network.inscribe(proof, wrongPrev, "build", "bad chain", bytes32(0));
     }
 
     // ─── Validator flow ──────────────────────────────────────────────────────
@@ -275,6 +275,179 @@ contract CustosNetworkImplTest is Test {
         vm.warp(block.timestamp + 11 minutes);
         vm.prank(agent1);
         vm.expectRevert();
-        network.inscribe(proof, genesisHead, "build", "paused");
+        network.inscribe(proof, genesisHead, "build", "paused", bytes32(0));
+    }
+
+    // ─── V5.4 Privacy Mode Tests ──────────────────────────────────────────────
+    function test_InscribeWithPrivacyHash() public {
+        vm.prank(agent1);
+        network.registerAgent("TestAgent");
+
+        bytes32 proof = keccak256("cycle1content");
+        bytes32 contentHash = keccak256(abi.encodePacked("secret content", bytes32("salt")));
+
+        vm.warp(block.timestamp + 11 minutes);
+        vm.prank(agent1);
+        network.inscribe(proof, genesisHead, "research", "private work", contentHash);
+
+        // Check inscription was created
+        assertEq(network.inscriptionCount(), 1);
+        assertEq(network.inscriptionContentHash(1), contentHash);
+        assertEq(network.inscriptionAgent(1), agent1);
+        assertEq(network.inscriptionRevealed(1), false);
+        assertEq(network.proofHashToInscriptionId(proof), 1);
+
+        // Check view function
+        (bool revealed, string memory content, bytes32 storedHash) = network.getInscriptionContent(1);
+        assertEq(revealed, false);
+        assertEq(content, "");
+        assertEq(storedHash, contentHash);
+    }
+
+    function test_RevealContent() public {
+        vm.prank(agent1);
+        network.registerAgent("TestAgent");
+
+        string memory secretContent = "sensitive work details";
+        bytes32 salt = keccak256("my_secret_salt");
+        bytes32 contentHash = keccak256(abi.encodePacked(secretContent, salt));
+        bytes32 proof = keccak256("cycle1content");
+
+        vm.warp(block.timestamp + 11 minutes);
+        vm.prank(agent1);
+        network.inscribe(proof, genesisHead, "research", "private work", contentHash);
+
+        // Reveal the content
+        vm.prank(agent1);
+        network.reveal(1, secretContent, salt);
+
+        // Check revealed state
+        assertEq(network.inscriptionRevealed(1), true);
+        assertEq(network.inscriptionRevealedContent(1), secretContent);
+
+        // Check view function
+        (bool revealed, string memory content, bytes32 storedHash) = network.getInscriptionContent(1);
+        assertEq(revealed, true);
+        assertEq(content, secretContent);
+        assertEq(storedHash, contentHash);
+    }
+
+    function test_CannotRevealWithWrongSalt() public {
+        vm.prank(agent1);
+        network.registerAgent("TestAgent");
+
+        string memory secretContent = "sensitive work details";
+        bytes32 salt = keccak256("my_secret_salt");
+        bytes32 wrongSalt = keccak256("wrong_salt");
+        bytes32 contentHash = keccak256(abi.encodePacked(secretContent, salt));
+        bytes32 proof = keccak256("cycle1content");
+
+        vm.warp(block.timestamp + 11 minutes);
+        vm.prank(agent1);
+        network.inscribe(proof, genesisHead, "research", "private work", contentHash);
+
+        // Try to reveal with wrong salt
+        vm.prank(agent1);
+        vm.expectRevert("Hash mismatch: invalid content or salt");
+        network.reveal(1, secretContent, wrongSalt);
+    }
+
+    function test_CannotRevealIfNotInscriber() public {
+        vm.prank(agent1);
+        network.registerAgent("TestAgent");
+
+        vm.prank(agent2);
+        network.registerAgent("OtherAgent");
+
+        string memory secretContent = "sensitive work details";
+        bytes32 salt = keccak256("my_secret_salt");
+        bytes32 contentHash = keccak256(abi.encodePacked(secretContent, salt));
+        bytes32 proof = keccak256("cycle1content");
+
+        vm.warp(block.timestamp + 11 minutes);
+        vm.prank(agent1);
+        network.inscribe(proof, genesisHead, "research", "private work", contentHash);
+
+        // agent2 tries to reveal
+        vm.prank(agent2);
+        vm.expectRevert("Only inscriber can reveal");
+        network.reveal(1, secretContent, salt);
+    }
+
+    function test_CannotRevealPublicInscription() public {
+        vm.prank(agent1);
+        network.registerAgent("TestAgent");
+
+        bytes32 proof = keccak256("cycle1content");
+
+        vm.warp(block.timestamp + 11 minutes);
+        vm.prank(agent1);
+        network.inscribe(proof, genesisHead, "build", "public work", bytes32(0));
+
+        // Try to reveal a public inscription
+        vm.prank(agent1);
+        vm.expectRevert("Public inscription, nothing to reveal");
+        network.reveal(1, "content", bytes32("salt"));
+    }
+
+    function test_CannotRevealTwice() public {
+        vm.prank(agent1);
+        network.registerAgent("TestAgent");
+
+        string memory secretContent = "sensitive work details";
+        bytes32 salt = keccak256("my_secret_salt");
+        bytes32 contentHash = keccak256(abi.encodePacked(secretContent, salt));
+        bytes32 proof = keccak256("cycle1content");
+
+        vm.warp(block.timestamp + 11 minutes);
+        vm.prank(agent1);
+        network.inscribe(proof, genesisHead, "research", "private work", contentHash);
+
+        vm.prank(agent1);
+        network.reveal(1, secretContent, salt);
+
+        // Try to reveal again
+        vm.prank(agent1);
+        vm.expectRevert("Already revealed");
+        network.reveal(1, secretContent, salt);
+    }
+
+    function test_InvalidInscriptionId() public {
+        vm.prank(agent1);
+        network.registerAgent("TestAgent");
+
+        // Try to reveal invalid ID
+        vm.prank(agent1);
+        vm.expectRevert("Invalid inscriptionId");
+        network.reveal(999, "content", bytes32("salt"));
+
+        // Try to get content for invalid ID
+        vm.expectRevert("Invalid inscriptionId");
+        network.getInscriptionContent(999);
+    }
+
+    function test_ProofInscribedEventWithNewParams() public {
+        vm.prank(agent1);
+        network.registerAgent("TestAgent");
+
+        bytes32 proof = keccak256("cycle1content");
+        bytes32 contentHash = keccak256(abi.encodePacked("secret", bytes32("salt")));
+
+        vm.warp(block.timestamp + 11 minutes);
+        vm.prank(agent1);
+
+        // Check event is emitted with new params
+        vm.expectEmit(true, true, false, false);
+        emit CustosNetworkImpl.ProofInscribed(
+            1,                      // agentId
+            proof,                  // proofHash
+            genesisHead,            // prevHash
+            "research",             // blockType
+            "private work",         // summary
+            contentHash,            // contentHash (NEW)
+            1,                      // inscriptionId (NEW)
+            block.timestamp         // timestamp
+        );
+        network.inscribe(proof, genesisHead, "research", "private work", contentHash);
     }
 }
