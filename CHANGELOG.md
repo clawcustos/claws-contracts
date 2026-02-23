@@ -1,5 +1,50 @@
 # CustosNetwork Contract Changelog
 
+## V5.5 — 2026-02-23
+**Implementation:** `0xC881794D0dff9a4829C9Efb2e88FF3E2F59EFC63` (verified)
+**Proxy:** `0x9B5FD0B02355E954F159F33D7886e4198ee777b9` (unchanged)
+**Source:** `src/CustosNetworkProxyV55.sol`
+**Upgrade tx (propose):** `0x08953cba38127f146d40a39c04c57f7087720d31c1cdce5e52378e219523bc2f`
+**Status:** Awaiting Pizza `confirmUpgrade(0xC881794D0dff9a4829C9Efb2e88FF3E2F59EFC63)`
+
+### Changes
+- Skill marketplace: `registerSkill(name, version, feePerExecution)` — 0.01 USDC registration fee
+- Execution proof: `proveExecution(skillAgentId, executionHash)` — locks 2x fee in escrow
+- Pull payment: `claimPayment(executionId)` — after 24h dispute window, skill gets fee + client gets bond back
+- Dispute bond: `fileDispute(executionId)` — posts 1x fee bond; loser forfeits to winner
+- Validator voting: `voteOnDispute(executionId, uphold)` — auto-resolves at 2 votes
+- Admin fallback: `resolveDisputeAdmin(executionId, clientWins)` — custodian force-resolve for ties
+- `deactivateSkill(agentId)` — custodian can kill malicious skills
+- `getSkillMetadata(agentId)`, `getExecution(executionId)`, `getDisputeBond(executionId)` — view helpers
+- `via_ir = true` in foundry.toml (required to fit EIP-170; runtime = 23,996 bytes)
+
+### Storage (appended to V5.4 slots)
+| Slot | Field | Type |
+|---|---|---|
+| 30 | skillMetadata | mapping(uint256 => SkillMetadata) |
+| 31 | executionCount | uint256 |
+| 32 | executions | mapping(uint256 => ExecutionRecord) |
+| 33 | disputes | mapping(uint256 => DisputeRecord) |
+| 34 | executionEscrow | mapping(uint256 => uint256) |
+| 35 | skillClaimable | mapping(uint256 => uint256) |
+| 36 | disputeVoted | mapping(uint256 => mapping(address => bool)) |
+
+### Constants
+| Name | Value |
+|---|---|
+| SKILL_INSCRIPTION_FEE | 0.01 USDC (10,000) |
+| DISPUTE_WINDOW | 24 hours |
+| VOTE_WINDOW | 48 hours |
+| MIN_DISPUTE_VOTES | 2 |
+
+### Notes
+- 15/15 tests passing (`test/CustosNetworkProxyV55.t.sol`)
+- Skills auto-register as agents on `registerSkill()` if not already registered
+- Self-execution prevented (`clientAgentId != skillAgentId`)
+- Bond design: malicious disputes expensive — loser forfeits bond to winner
+
+---
+
 ## V5.4 — 2026-02-23
 **Implementation:** `0x1f45Ddd0F7154DD181667dd4ffaC7a5b82535767` (verified)
 **Proxy:** `0x9B5FD0B02355E954F159F33D7886e4198ee777b9` (unchanged)
