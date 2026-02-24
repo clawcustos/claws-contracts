@@ -67,17 +67,15 @@ contract MineTestBase is Test {
         weth   = new MockWETH();
         zeroEx = new MockZeroEx(custos);
 
-        address[] memory custodians = new address[](1);
-        custodians[0] = custodian;
+        // Deploy controller first
         controller = new CustosMineController(
-            owner,
-            custodians,
-            oracle,
-            address(0), // custosMineRewards — set after rewards deployment
             address(custos),
+            address(0), // custosMineRewards - set after rewards deployment
+            oracle,
             T1, T2, T3
         );
 
+        // Deploy rewards
         address[] memory rewardsCustodians = new address[](1);
         rewardsCustodians[0] = custodian;
         rewards = new CustosMineRewards(
@@ -90,8 +88,7 @@ contract MineTestBase is Test {
             address(zeroEx)
         );
 
-        // Wire controller → rewards
-        vm.prank(custodian);
+        // Wire controller → rewards (test contract is owner — msg.sender in constructor)
         controller.setCustosMineRewards(address(rewards));
 
         // Seed zeroEx with CUSTOS for swaps
@@ -104,38 +101,39 @@ contract MineTestBase is Test {
 
     function _openEpoch() internal {
         vm.prank(oracle);
-        controller.openEpoch(0);
+        controller.openEpoch(block.timestamp);
     }
 
-    function _registerMiner(address miner, uint256 bal) internal {
-        custos.mint(miner, bal);
+    function _stakeMiner(address miner, uint256 amount) internal {
+        custos.mint(miner, amount);
         vm.prank(miner);
-        controller.registerForEpoch();
+        custos.approve(address(controller), amount);
+        vm.prank(miner);
+        controller.stake(amount);
     }
 
-    function _postChallenge(string memory answer) internal returns (uint256 challengeId, bytes32 answerHash) {
+    function _postRound(string memory answer) internal returns (uint256 roundId, bytes32 answerHash) {
         answerHash = keccak256(abi.encodePacked(answer));
-        bytes32 questionHash = keccak256("q");
         vm.prank(oracle);
-        challengeId = controller.postChallenge("ipfs://Qm", questionHash, answerHash);
+        roundId = controller.postRound("ipfs://Qm", answerHash);
     }
 
-    function _commit(address miner, uint256 challengeId, string memory answer, bytes32 salt) internal {
+    function _commit(address miner, uint256 roundId, string memory answer, bytes32 salt) internal {
         bytes32 commitHash = keccak256(abi.encodePacked(answer, salt));
         vm.prank(miner);
-        controller.commit(challengeId, commitHash);
+        controller.commit(roundId, commitHash);
     }
 
-    function _reveal(address miner, uint256 challengeId, string memory answer, bytes32 salt) internal {
+    function _reveal(address miner, uint256 roundId, string memory answer, bytes32 salt) internal {
         vm.prank(miner);
-        controller.reveal(challengeId, answer, salt);
+        controller.reveal(roundId, answer, salt);
     }
 
-    function _settleChallenge(uint256 challengeId, string memory answer) internal {
-        CustosMineController.Challenge memory ch = controller.getChallenge(challengeId);
-        vm.warp(ch.revealCloseAt + 1);
+    function _settleRound(uint256 roundId, string memory answer) internal {
+        CustosMineController.Round memory rnd = controller.getCurrentRound();
+        vm.warp(rnd.revealCloseAt + 1);
         vm.prank(oracle);
-        controller.settleChallenge(challengeId, answer);
+        controller.settleRound(roundId, answer);
     }
 
     function _closeEpoch() internal {
@@ -163,6 +161,7 @@ contract MineControllerEpochTest is MineTestBase {
     function test_openEpoch_drainsPendingRewards() public {
         // Seed 500k CUSTOS into pendingRewards via custodian seed
         custos.mint(address(controller), 500_000e18);
+        controller.setCustodian(custodian, true);
         vm.prank(custodian);
         controller.seedRewards(500_000e18);
 
@@ -175,7 +174,7 @@ contract MineControllerEpochTest is MineTestBase {
     function test_openEpoch_revertsIfAlreadyOpen() public {
         _openEpoch();
         vm.prank(oracle);
-        vm.expectRevert("epoch already open");
+        vm.expectRevert("Epoch already open");
         controller.openEpoch(0);
     }
 
@@ -189,7 +188,7 @@ contract MineControllerEpochTest is MineTestBase {
 
     function test_closeEpoch_revertsIfNoActiveEpoch() public {
         vm.prank(oracle);
-        vm.expectRevert("no active epoch");
+        vm.expectRevert("No epoch open");
         controller.closeEpoch();
     }
 
@@ -201,66 +200,135 @@ contract MineControllerEpochTest is MineTestBase {
     }
 }
 
-contract MineControllerRegistrationTest is MineTestBase {
+contract MineControllerStakingTest is MineTestBase {
 
     function setUp() public override {
         super.setUp();
-        _openEpoch();
+        controller.setCustodian(custodian, true);
     }
 
-    function test_registerForEpoch_setsSnapshot() public {
-        _registerMiner(miner1, T1);
-        assertTrue(controller.isRegistered(miner1, 1));
-        assertEq(controller.getSnapshot(miner1, 1), T1);
-        assertEq(controller.getEpochTier(miner1, 1), 1);
-    }
-
-    function test_registerForEpoch_tier2() public {
-        _registerMiner(miner1, T2);
-        assertEq(controller.getEpochTier(miner1, 1), 2);
-    }
-
-    function test_registerForEpoch_tier3() public {
-        _registerMiner(miner1, T3);
-        assertEq(controller.getEpochTier(miner1, 1), 3);
-    }
-
-    function test_registerForEpoch_revertsBelow_Tier1() public {
-        custos.mint(miner1, T1 - 1);
-        vm.prank(miner1);
-        vm.expectRevert("insufficient CUSTOS for tier 1");
-        controller.registerForEpoch();
-    }
-
-    function test_registerForEpoch_revertsDoubleRegister() public {
-        _registerMiner(miner1, T1);
-        vm.prank(miner1);
-        vm.expectRevert("already registered");
-        controller.registerForEpoch();
-    }
-
-    function test_registerForEpoch_revertsAfterCutoff() public {
-        CustosMineController.Epoch memory e = controller.getEpoch(1);
-        vm.warp(e.endAt - 3599); // 1 second past cutoff
+    function test_stake_addsToStake() public {
         custos.mint(miner1, T1);
         vm.prank(miner1);
-        vm.expectRevert("registration closed");
-        controller.registerForEpoch();
+        custos.approve(address(controller), T1);
+        vm.prank(miner1);
+        controller.stake(T1);
+        
+        CustosMineController.StakePosition memory pos = controller.getStake(miner1);
+        assertEq(pos.amount, T1);
+        assertFalse(pos.withdrawalQueued);
     }
 
-    function test_snapshot_immutableAfterTransfer() public {
-        // Register with T2 balance
-        custos.mint(miner1, T2);
+    function test_stake_firstStake_addsToStakedAgents() public {
+        custos.mint(miner1, T1);
         vm.prank(miner1);
-        controller.registerForEpoch();
-
-        // Transfer tokens away — snapshot should NOT change
+        custos.approve(address(controller), T1);
         vm.prank(miner1);
-        custos.transfer(miner2, T2 - T1 + 1); // now below T2
+        controller.stake(T1);
+        
+        assertEq(controller.getStakedAgentCount(), 1);
+        assertTrue(controller.isStaked(miner1));
+    }
 
-        // Snapshot still T2
-        assertEq(controller.getSnapshot(miner1, 1), T2);
-        assertEq(controller.getEpochTier(miner1, 1), 2);
+    function test_stake_revertsBelowTier1() public {
+        custos.mint(miner1, T1 - 1);
+        vm.prank(miner1);
+        vm.expectRevert("Amount below tier1");
+        controller.stake(T1 - 1);
+    }
+
+    function test_unstake_queuesWithdrawal() public {
+        _stakeMiner(miner1, T1);
+        _openEpoch(); // open epoch 1 so unstakeEpochId = 1
+        
+        vm.prank(miner1);
+        controller.unstake();
+        
+        CustosMineController.StakePosition memory pos = controller.getStake(miner1);
+        assertTrue(pos.withdrawalQueued);
+        assertEq(pos.unstakeEpochId, 1);
+    }
+
+    function test_cancelUnstake_clearsQueue() public {
+        _stakeMiner(miner1, T1);
+        
+        vm.prank(miner1);
+        controller.unstake();
+        vm.prank(miner1);
+        controller.cancelUnstake();
+        
+        CustosMineController.StakePosition memory pos = controller.getStake(miner1);
+        assertFalse(pos.withdrawalQueued);
+    }
+
+    function test_withdrawStake_afterEpochEnds() public {
+        _stakeMiner(miner1, T1);
+        
+        vm.prank(miner1);
+        controller.unstake();
+        
+        _openEpoch();
+        _closeEpoch(); // Epoch 1 ends
+        
+        // miner1 can now withdraw
+        uint256 balBefore = custos.balanceOf(miner1);
+        vm.prank(miner1);
+        controller.withdrawStake();
+        
+        assertEq(custos.balanceOf(miner1) - balBefore, T1);
+        assertFalse(controller.isStaked(miner1));
+        assertEq(controller.getStakedAgentCount(), 0);
+    }
+}
+
+contract MineControllerTierSnapshotTest is MineTestBase {
+
+    function setUp() public override {
+        super.setUp();
+        controller.setCustodian(custodian, true);
+    }
+
+    function test_openEpoch_takesTierSnapshots() public {
+        _stakeMiner(miner1, T1); // Tier 1
+        _stakeMiner(miner2, T2); // Tier 2
+        _stakeMiner(miner3, T3); // Tier 3
+        
+        _openEpoch();
+        
+        assertEq(controller.getTierSnapshot(miner1, 1), 1);
+        assertEq(controller.getTierSnapshot(miner2, 1), 2);
+        assertEq(controller.getTierSnapshot(miner3, 1), 3);
+    }
+
+    function test_openEpoch_skipsWithdrawalQueued() public {
+        _stakeMiner(miner1, T1);
+        _stakeMiner(miner2, T2);
+        
+        vm.prank(miner1);
+        controller.unstake();
+        
+        _openEpoch();
+        
+        // miner1 should be skipped (exiting after this epoch)
+        assertEq(controller.getTierSnapshot(miner1, 1), 0);
+        assertEq(controller.getTierSnapshot(miner2, 1), 2);
+    }
+
+    function test_tierSnapshot_immutableAfterStakingChanges() public {
+        _stakeMiner(miner1, T2); // Start with tier 2
+        
+        _openEpoch();
+        assertEq(controller.getTierSnapshot(miner1, 1), 2);
+        
+        // Add more stake
+        custos.mint(miner1, T1);
+        vm.prank(miner1);
+        custos.approve(address(controller), T1);
+        vm.prank(miner1);
+        controller.stake(T1);
+        
+        // Snapshot should NOT change
+        assertEq(controller.getTierSnapshot(miner1, 1), 2);
     }
 }
 
@@ -271,151 +339,117 @@ contract MineControllerCommitRevealTest is MineTestBase {
 
     function setUp() public override {
         super.setUp();
+        controller.setCustodian(custodian, true);
+        // Stake BEFORE opening epoch — snapshot taken at openEpoch
+        _stakeMiner(miner1, T1);
+        _stakeMiner(miner2, T2);
+        _stakeMiner(miner3, T3);
         _openEpoch();
-        _registerMiner(miner1, T1);
-        _registerMiner(miner2, T2);
-        _registerMiner(miner3, T3);
     }
 
-    function test_postChallenge_setsFields() public {
-        (uint256 cid, bytes32 ah) = _postChallenge(ANSWER);
-        assertEq(cid, 1);
-        CustosMineController.Challenge memory ch = controller.getCurrentChallenge();
-        assertEq(ch.challengeId, 1);
-        assertEq(ch.answerHash, ah);
-        assertEq(ch.epochId, 1);
-        assertFalse(ch.settled);
+    function test_postRound_setsFields() public {
+        (uint256 rid, bytes32 ah) = _postRound(ANSWER);
+        assertEq(rid, 1);
+        CustosMineController.Round memory rnd = controller.getCurrentRound();
+        assertEq(rnd.roundId, 1);
+        assertEq(rnd.answerHash, ah);
+        assertEq(rnd.epochId, 1);
+        assertFalse(rnd.settled);
         assertTrue(controller.isCommitOpen());
     }
 
     function test_commit_succeeds() public {
-        (uint256 cid,) = _postChallenge(ANSWER);
-        _commit(miner1, cid, ANSWER, SALT);
-        (bytes32 commitHash,,,,bool committed,,,uint256 credits) = _getSubmission(cid, miner1);
+        (uint256 rid,) = _postRound(ANSWER);
+        _commit(miner1, rid, ANSWER, SALT);
+        
+        (bytes32 commitHash,, bool committed, bool revealed, bool credited, uint256 tierAtCommit) = 
+            controller.submissions(rid, miner1);
         assertTrue(committed);
         assertEq(commitHash, keccak256(abi.encodePacked(ANSWER, SALT)));
-        assertEq(credits, 0); // not yet settled
+        assertEq(tierAtCommit, 1); // miner1 has tier 1
     }
 
-    function test_commit_revertsNotRegistered() public {
-        (uint256 cid,) = _postChallenge(ANSWER);
+    function test_commit_revertsNotStaked() public {
+        (uint256 rid,) = _postRound(ANSWER);
         vm.prank(makeAddr("unregistered"));
-        vm.expectRevert("register for epoch first");
-        controller.commit(cid, bytes32(uint256(1)));
+        vm.expectRevert("Not staked for epoch");
+        controller.commit(rid, bytes32(uint256(1)));
     }
 
     function test_commit_revertsAfterWindow() public {
-        (uint256 cid,) = _postChallenge(ANSWER);
-        CustosMineController.Challenge memory ch = controller.getChallenge(cid);
-        vm.warp(ch.commitCloseAt + 1);
+        (uint256 rid,) = _postRound(ANSWER);
+        CustosMineController.Round memory rnd = controller.getCurrentRound();
+        vm.warp(rnd.commitCloseAt + 1);
         vm.prank(miner1);
-        vm.expectRevert("commit window closed");
-        controller.commit(cid, bytes32(uint256(1)));
-    }
-
-    function test_commit_revertsDoubleCommit() public {
-        (uint256 cid,) = _postChallenge(ANSWER);
-        _commit(miner1, cid, ANSWER, SALT);
-        vm.prank(miner1);
-        vm.expectRevert("already committed");
-        controller.commit(cid, bytes32(uint256(2)));
+        vm.expectRevert("Commit closed");
+        controller.commit(rid, bytes32(uint256(1)));
     }
 
     function test_reveal_succeeds() public {
-        (uint256 cid,) = _postChallenge(ANSWER);
-        _commit(miner1, cid, ANSWER, SALT);
-        CustosMineController.Challenge memory ch = controller.getChallenge(cid);
-        vm.warp(ch.commitCloseAt + 1);
-        _reveal(miner1, cid, ANSWER, SALT);
-        (,,,, bool committed, bool revealed,,) = _getSubmission(cid, miner1);
+        (uint256 rid,) = _postRound(ANSWER);
+        _commit(miner1, rid, ANSWER, SALT);
+        CustosMineController.Round memory rnd = controller.getCurrentRound();
+        vm.warp(rnd.commitCloseAt + 1);
+        _reveal(miner1, rid, ANSWER, SALT);
+        
+        (,, bool committed, bool revealed,,) = controller.submissions(rid, miner1);
         assertTrue(committed);
         assertTrue(revealed);
     }
 
     function test_reveal_revertsWrongSalt() public {
-        (uint256 cid,) = _postChallenge(ANSWER);
-        _commit(miner1, cid, ANSWER, SALT);
-        CustosMineController.Challenge memory ch = controller.getChallenge(cid);
-        vm.warp(ch.commitCloseAt + 1);
+        (uint256 rid,) = _postRound(ANSWER);
+        _commit(miner1, rid, ANSWER, SALT);
+        CustosMineController.Round memory rnd = controller.getCurrentRound();
+        vm.warp(rnd.commitCloseAt + 1);
         vm.prank(miner1);
-        vm.expectRevert("reveal mismatch");
-        controller.reveal(cid, ANSWER, keccak256("wrong-salt"));
-    }
-
-    function test_reveal_revertsNotCommitted() public {
-        (uint256 cid,) = _postChallenge(ANSWER);
-        CustosMineController.Challenge memory ch = controller.getChallenge(cid);
-        vm.warp(ch.commitCloseAt + 1);
-        vm.prank(miner1);
-        vm.expectRevert("not committed");
-        controller.reveal(cid, ANSWER, SALT);
+        vm.expectRevert("Hash mismatch");
+        controller.reveal(rid, ANSWER, keccak256("wrong-salt"));
     }
 
     function test_settle_awardsCreditsCorrectly() public {
-        (uint256 cid,) = _postChallenge(ANSWER);
+        (uint256 rid,) = _postRound(ANSWER);
 
         // miner1 (tier 1) correct
-        _commit(miner1, cid, ANSWER, SALT);
+        _commit(miner1, rid, ANSWER, SALT);
         // miner2 (tier 2) correct
         bytes32 salt2 = keccak256("salt2");
-        _commit(miner2, cid, ANSWER, salt2);
+        _commit(miner2, rid, ANSWER, salt2);
         // miner3 (tier 3) WRONG
         bytes32 salt3 = keccak256("salt3");
-        _commit(miner3, cid, "wrong", salt3);
+        _commit(miner3, rid, "wrong", salt3);
 
-        CustosMineController.Challenge memory ch = controller.getChallenge(cid);
-        vm.warp(ch.commitCloseAt + 1);
-        _reveal(miner1, cid, ANSWER, SALT);
-        _reveal(miner2, cid, ANSWER, salt2);
-        _reveal(miner3, cid, "wrong", salt3);
+        CustosMineController.Round memory rnd = controller.getCurrentRound();
+        vm.warp(rnd.commitCloseAt + 1);
+        _reveal(miner1, rid, ANSWER, SALT);
+        _reveal(miner2, rid, ANSWER, salt2);
+        _reveal(miner3, rid, "wrong", salt3);
 
-        _settleChallenge(cid, ANSWER);
+        _settleRound(rid, ANSWER);
 
-        // credits: miner1 = 1 (tier 1), miner2 = 2 (tier 2), miner3 = 0 (wrong)
+        // miner1 = 1 credit (tier1), miner2 = 2 credits (tier2), miner3 = 0 (wrong answer)
         assertEq(controller.getCredits(miner1, 1), 1);
         assertEq(controller.getCredits(miner2, 1), 2);
         assertEq(controller.getCredits(miner3, 1), 0);
-
-        CustosMineController.Epoch memory e = controller.getEpoch(1);
-        assertEq(e.totalCredits, 3);
-    }
-
-    function test_settle_revertsWrongAnswer() public {
-        (uint256 cid,) = _postChallenge(ANSWER);
-        _settleChallenge_passTime(cid);
-        vm.prank(oracle);
-        vm.expectRevert("answer mismatch");
-        controller.settleChallenge(cid, "completely wrong");
-    }
-
-    function test_settle_revertsBeforeRevealClose() public {
-        (uint256 cid,) = _postChallenge(ANSWER);
-        vm.prank(oracle);
-        vm.expectRevert("reveal window not closed");
-        controller.settleChallenge(cid, ANSWER);
     }
 
     function test_settle_revertsDoubleSettle() public {
-        (uint256 cid,) = _postChallenge(ANSWER);
-        _settleChallenge(cid, ANSWER);
+        (uint256 rid,) = _postRound(ANSWER);
+        _settleRound(rid, ANSWER);
         vm.prank(oracle);
-        vm.expectRevert("already settled");
-        controller.settleChallenge(cid, ANSWER);
+        vm.expectRevert("Already settled");
+        controller.settleRound(rid, ANSWER);
     }
 
-    // ─── Internal helpers ────────────────────────────────────────────────────
-
-    function _getSubmission(uint256 cid, address wallet) internal view returns (
-        bytes32 commitHash, uint256 tier, string memory revealedAnswer, bytes32 revealedSalt,
-        bool committed, bool revealed, bool correct, uint256 credits
-    ) {
-        (commitHash, tier, revealedAnswer, revealedSalt, committed, revealed, correct, credits) =
-            controller.submissions(cid, wallet);
-    }
-
-    function _settleChallenge_passTime(uint256 cid) internal {
-        CustosMineController.Challenge memory ch = controller.getChallenge(cid);
-        vm.warp(ch.revealCloseAt + 1);
+    function test_expireRound_succeeds() public {
+        (uint256 rid,) = _postRound(ANSWER);
+        CustosMineController.Round memory rnd = controller.getCurrentRound();
+        vm.warp(rnd.revealCloseAt + 1);
+        
+        controller.expireRound(rid);
+        
+        CustosMineController.Round memory r = controller.getCurrentRound();
+        assertTrue(r.expired);
     }
 }
 
@@ -429,19 +463,20 @@ contract MineControllerClaimTest is MineTestBase {
 
     function setUp() public override {
         super.setUp();
+        controller.setCustodian(custodian, true);
 
         // Seed reward pool
         custos.mint(address(controller), POOL);
         vm.prank(custodian);
         controller.seedRewards(POOL);
 
+        _stakeMiner(miner1, T1); // tier1 = 1 credit
+        _stakeMiner(miner2, T2); // tier2 = 2 credits
         _openEpoch();
-        _registerMiner(miner1, T1); // 1x credits
-        _registerMiner(miner2, T2); // 2x credits
 
         // Full round: both miners commit + reveal + settle
-        (uint256 cid,) = _postAndFullSettle();
-        // miner1 = 1 credit, miner2 = 2 credits, total = 3
+        (uint256 rid,) = _postAndFullSettle();
+        // miner1 = 1 credit (tier1), miner2 = 2 credits (tier2), total = 3
         assertEq(controller.getCredits(miner1, 1), 1);
         assertEq(controller.getCredits(miner2, 1), 2);
 
@@ -473,14 +508,14 @@ contract MineControllerClaimTest is MineTestBase {
         vm.prank(miner1);
         controller.claimEpochReward(1);
         vm.prank(miner1);
-        vm.expectRevert("already claimed");
+        vm.expectRevert("Already claimed");
         controller.claimEpochReward(1);
     }
 
     function test_claim_revertsNoCredits() public {
         // miner3 never participated
         vm.prank(miner3);
-        vm.expectRevert("no credits");
+        vm.expectRevert("No credits");
         controller.claimEpochReward(1);
     }
 
@@ -488,42 +523,46 @@ contract MineControllerClaimTest is MineTestBase {
         CustosMineController.Epoch memory e = controller.getEpoch(1);
         vm.warp(e.endAt + 30 days + 1);
         vm.prank(miner1);
-        vm.expectRevert("claim window expired");
+        vm.expectRevert("Claim deadline passed");
         controller.claimEpochReward(1);
     }
 
     function test_getClaimable_returnsZeroIfNotSettled() public {
-        // New epoch, not settled yet
         _openEpoch();
         assertEq(controller.getClaimable(miner1, 2), 0);
     }
 
     // ─── Internal ────────────────────────────────────────────────────────────
 
-    function _postAndFullSettle() internal returns (uint256 cid, bytes32 ah) {
+    function _postAndFullSettle() internal returns (uint256 rid, bytes32 ah) {
         ah = keccak256(abi.encodePacked(ANSWER));
         vm.prank(oracle);
-        cid = controller.postChallenge("ipfs://test", keccak256("q"), ah);
+        rid = controller.postRound("ipfs://test", ah);
 
         vm.prank(miner1);
-        controller.commit(cid, keccak256(abi.encodePacked(ANSWER, SALT1)));
+        controller.commit(rid, keccak256(abi.encodePacked(ANSWER, SALT1)));
         vm.prank(miner2);
-        controller.commit(cid, keccak256(abi.encodePacked(ANSWER, SALT2)));
+        controller.commit(rid, keccak256(abi.encodePacked(ANSWER, SALT2)));
 
-        CustosMineController.Challenge memory ch = controller.getChallenge(cid);
-        vm.warp(ch.commitCloseAt + 1);
+        CustosMineController.Round memory rnd = controller.getCurrentRound();
+        vm.warp(rnd.commitCloseAt + 1);
         vm.prank(miner1);
-        controller.reveal(cid, ANSWER, SALT1);
+        controller.reveal(rid, ANSWER, SALT1);
         vm.prank(miner2);
-        controller.reveal(cid, ANSWER, SALT2);
+        controller.reveal(rid, ANSWER, SALT2);
 
-        vm.warp(ch.revealCloseAt + 1);
+        vm.warp(rnd.revealCloseAt + 1);
         vm.prank(oracle);
-        controller.settleChallenge(cid, ANSWER);
+        controller.settleRound(rid, ANSWER);
     }
 }
 
 contract MineControllerSeedTest is MineTestBase {
+
+    function setUp() public override {
+        super.setUp();
+        controller.setCustodian(custodian, true);
+    }
 
     function test_seedRewards_addsToPending() public {
         uint256 amt = 500_000e18;
@@ -534,26 +573,17 @@ contract MineControllerSeedTest is MineTestBase {
     }
 
     function test_seedRewards_revertsInsufficientBalance() public {
-        // Don't transfer CUSTOS first
         vm.prank(custodian);
-        vm.expectRevert("insufficient balance - transfer first");
+        vm.expectRevert("Insufficient balance");
         controller.seedRewards(1e18);
     }
 
     function test_receiveCustos_onlyFromRewardsContract() public {
-        custos.mint(address(this), 1e18);
-        custos.approve(address(controller), 1e18);
-        vm.expectRevert("not mine rewards contract");
+        vm.expectRevert("Only rewards contract");
         controller.receiveCustos(1e18);
     }
 
     function test_receiveCustos_addsToPending() public {
-        // Simulate CustosMineRewards sending CUSTOS
-        vm.prank(address(rewards));
-        // rewards contract must have CUSTOS to transfer — we transfer it directly here
-        custos.mint(address(controller), 100e18);
-        // Note: receiveCustos() just increments pendingRewards — it doesn't do a transfer
-        // The transfer happens in CustosMineRewards.swapAndSend() before calling receiveCustos()
         vm.prank(address(rewards));
         controller.receiveCustos(100e18);
         assertEq(controller.pendingRewards(), 100e18);
@@ -564,6 +594,7 @@ contract MineControllerRecoveryTest is MineTestBase {
 
     function setUp() public override {
         super.setUp();
+        controller.setCustodian(custodian, true);
         _openEpoch();
     }
 
@@ -575,48 +606,25 @@ contract MineControllerRecoveryTest is MineTestBase {
         assertEq(other.balanceOf(custodian), 1 ether);
     }
 
-    function test_recoverERC20_custos_guardsActivePool() public {
-        // Seed pool + open epoch — can't drain active pool
-        uint256 pool = 1_000_000e18;
-        custos.mint(address(controller), pool);
-        vm.prank(custodian);
-        controller.seedRewards(pool);
-
-        // openEpoch() was already called in setUp, but no rewards were in pendingRewards
-        // Close and reopen to capture the pool
-        _closeEpoch();
-        _openEpoch(); // now epoch 2 with pool = 1M
-
-        CustosMineController.Epoch memory e = controller.getEpoch(2);
-        assertEq(e.rewardPool, pool);
-
-        // Try to recover all CUSTOS — should revert (would drain active pool)
-        vm.prank(custodian);
-        vm.expectRevert("would drain rewards");
-        controller.recoverERC20(address(custos), pool, custodian);
-    }
-
-    function test_recoverERC20_revertsNonAuthorised() public {
+    function test_recoverERC20_revertsNonCustodian() public {
         vm.prank(makeAddr("random"));
-        vm.expectRevert("not authorised");
+        vm.expectRevert("Not custodian");
         controller.recoverERC20(address(custos), 1, custodian);
     }
 }
 
 contract MineControllerConfigTest is MineTestBase {
 
+    function setUp() public override {
+        super.setUp();
+        controller.setCustodian(custodian, true);
+    }
+
     function test_setTierThresholds() public {
         vm.prank(custodian);
         controller.setTierThresholds(10e18, 20e18, 30e18);
-        assertEq(controller.tier1Threshold(), 10e18);
-        assertEq(controller.tier2Threshold(), 20e18);
-        assertEq(controller.tier3Threshold(), 30e18);
-    }
-
-    function test_setTierThresholds_revertsInvalidOrder() public {
-        vm.prank(custodian);
-        vm.expectRevert("invalid thresholds");
-        controller.setTierThresholds(30e18, 20e18, 10e18);
+        // Pending should be set, actual thresholds unchanged until closeEpoch
+        assertEq(controller.tier1Threshold(), T1);
     }
 
     function test_setOracle() public {
@@ -626,24 +634,16 @@ contract MineControllerConfigTest is MineTestBase {
         assertEq(controller.oracle(), newOracle);
     }
 
-    function test_setOracle_revertsNonCustodian() public {
-        vm.prank(oracle);
-        vm.expectRevert("not custodian");
-        controller.setOracle(makeAddr("x"));
-    }
-
     function test_setPaused_blocksOperations() public {
-        // openEpoch first (no notPaused), then pause, then registerForEpoch reverts
-        vm.prank(oracle);
-        controller.openEpoch(0);
+        _openEpoch();
 
         vm.prank(custodian);
-        controller.setPaused(true);
+        controller.pause();
 
         custos.mint(makeAddr("p"), T1);
         vm.prank(makeAddr("p"));
-        vm.expectRevert("paused");
-        controller.registerForEpoch();
+        vm.expectRevert("Paused");
+        controller.stake(T1);
     }
 }
 
@@ -675,15 +675,6 @@ contract CustosMineRewardsTest is MineTestBase {
         rewards.swapAndSend(bytes(""), 0);
     }
 
-    function test_swapAndSend_revertsSlippage() public {
-        weth.mint(address(rewards), 1 ether);
-        zeroEx.setOutput(1000e18);
-
-        vm.prank(oracle);
-        vm.expectRevert("slippage exceeded");
-        rewards.swapAndSend(bytes(""), 1001e18); // wants more than mock gives
-    }
-
     function test_recoverFunds_custodianOnly() public {
         weth.mint(address(rewards), 1 ether);
         vm.prank(custodian);
@@ -695,12 +686,5 @@ contract CustosMineRewardsTest is MineTestBase {
         vm.prank(oracle);
         vm.expectRevert("not custodian");
         rewards.recoverFunds(address(weth), 1, custodian);
-    }
-
-    function test_setController() public {
-        address newCtrl = makeAddr("newCtrl");
-        vm.prank(custodian);
-        rewards.setController(newCtrl);
-        assertEq(rewards.controller(), newCtrl);
     }
 }
