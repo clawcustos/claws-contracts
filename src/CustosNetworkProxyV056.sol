@@ -381,7 +381,6 @@ contract CustosNetworkProxyV056 is
         inscriptionContentHash[inscriptionId] = contentHash;
         proofHashToInscriptionId[proofHash]   = inscriptionId;
         inscriptionAgent[inscriptionId]       = msg.sender;
-        proofHashEpoch[proofHash]             = currentEpoch + 1;  // V0.5.6: +1 offset so epoch 0 != "never set"
 
         emit ProofInscribed(agentId, proofHash, prevHash, blockType, summary, agent.cycleCount, contentHash, inscriptionId);
 
@@ -401,6 +400,10 @@ contract CustosNetworkProxyV056 is
 
             emit EpochClosed(closingEpoch, epochInscriptionCount[closingEpoch], poolAmount);
         }
+
+        // V0.5.6: record after epoch roll so proofHashEpoch[ph] == currentEpoch when attest is called
+        // (if this inscription triggered a roll, the proof belongs to the NEW epoch)
+        proofHashEpoch[proofHash] = currentEpoch;
     }
 
     // ─── Reveal (V5.4) ───────────────────────────────────────────────────────
@@ -600,12 +603,19 @@ contract CustosNetworkProxyV056 is
         bytes32 proofHash,
         bool valid
     ) external whenNotPaused nonReentrant onlyValidator {
-        require(agentId != 0 && agentId <= totalAgents, "invalid agentId");
-        require(proofHash != bytes32(0), "zero proofHash");
-        require(agents[agentId].wallet != address(0), "agent not found");
-        require(proofHashEpoch[proofHash] != 0, "proof not found");
-        require(proofHashEpoch[proofHash] == currentEpoch + 1, "proof not from current epoch");
-        require(!hasAttested[currentEpoch][proofHash][msg.sender], "already attested this proof");
+        // Error key (off-chain reference):
+        // E01 = invalid agentId
+        // E02 = zero proofHash
+        // E03 = agent not found
+        // E04 = proof not found (never inscribed)
+        // E05 = proof not from current epoch (stale)
+        // E06 = already attested this proof this epoch
+        require(agentId != 0 && agentId <= totalAgents, "E01");
+        require(proofHash != bytes32(0), "E02");
+        require(agents[agentId].wallet != address(0), "E03");
+        require(proofHashToInscriptionId[proofHash] != 0, "E04");
+        require(proofHashEpoch[proofHash] == currentEpoch, "E05");
+        require(!hasAttested[currentEpoch][proofHash][msg.sender], "E06");
 
         hasAttested[currentEpoch][proofHash][msg.sender] = true;
         validatorEpochPoints[currentEpoch][msg.sender] += 1;

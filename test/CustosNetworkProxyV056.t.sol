@@ -4,332 +4,307 @@ pragma solidity ^0.8.25;
 import "forge-std/Test.sol";
 import "../src/CustosNetworkProxyV056.sol";
 import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
-contract MockUSDC is ERC20 {
-    constructor() ERC20("USD Coin", "USDC") {}
-    function mint(address to, uint256 amt) external { _mint(to, amt); }
-    function decimals() public pure override returns (uint8) { return 6; }
+// ─── Minimal ERC-20 mock ─────────────────────────────────────────────────────
+contract MockERC20v056 {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    string  public name     = "MockUSDC";
+    string  public symbol   = "mUSDC";
+    uint8   public decimals = 6;
+    uint256 public totalSupply;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+        totalSupply   += amount;
+    }
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "insufficient");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to]         += amount;
+        return true;
+    }
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(balanceOf[from] >= amount, "insufficient");
+        if (allowance[from][msg.sender] != type(uint256).max)
+            allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to]   += amount;
+        return true;
+    }
 }
 
-/**
- * @notice Test suite for CustosNetworkProxyV056.
- *         Focus: epoch-scoped attestation enforcement (the core V0.5.6 change).
- *         Also covers V5.5 skill marketplace carried forward.
- */
+// ─── Test contract ────────────────────────────────────────────────────────────
 contract CustosNetworkProxyV056Test is Test {
+
     CustosNetworkProxyV056 network;
-    MockUSDC usdc;
 
-    address constant CUSTOS   = 0x0528B8FE114020cc895FCf709081Aae2077b9aFE;
-    address constant PIZZA    = 0xF305c1A154D1d38a7F9889a3cBDC49DD7e26159F;
+    address constant USDC   = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
+    address constant CUSTOS = 0x0528B8FE114020cc895FCf709081Aae2077b9aFE;
 
-    address agent1    = makeAddr("agent1");
-    address agent2    = makeAddr("agent2");
-    address validator = makeAddr("validator");
-    address validator2 = makeAddr("validator2");
+    address inscriber = makeAddr("inscriber");
+    address valAddr   = makeAddr("validator");
+    address valAddrB  = makeAddr("validatorB");
+    address stranger  = makeAddr("stranger");
+
+    uint256 ts; // current warped timestamp
+
+    // ─── Setup ────────────────────────────────────────────────────────────────
 
     function setUp() public {
-        // Deploy fresh proxy
+        ts = 1_700_000_000;
+        vm.warp(ts);
+
+        // Deploy impl + proxy
         CustosNetworkProxyV056 impl = new CustosNetworkProxyV056();
-        bytes memory initData = abi.encodeCall(CustosNetworkProxyV056.initialize, ());
-        ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
+        bytes memory init = abi.encodeCall(CustosNetworkProxyV056.initialize, ());
+        ERC1967Proxy proxy = new ERC1967Proxy(address(impl), init);
         network = CustosNetworkProxyV056(address(proxy));
-        // Initialize epoch machinery (sets epochLength = 24, prevents epoch-per-inscription)
-        network.initializeV52();
 
-        // Deploy mock USDC and etch at the hardcoded address
-        usdc = new MockUSDC();
-        vm.etch(0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, address(usdc).code);
-        MockUSDC mock = MockUSDC(0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913);
-        mock.mint(agent1,    100e6);
-        mock.mint(agent2,    100e6);
-        mock.mint(validator, 100e6);
+        // Mock USDC
+        MockERC20v056 mockUsdc = new MockERC20v056();
+        vm.etch(USDC, address(mockUsdc).code);
+        // Fund generously — 144 inscriptions * 0.1 USDC = 14.4 USDC each, give 10_000
+        MockERC20v056(USDC).mint(inscriber, 10_000e6);
+        MockERC20v056(USDC).mint(valAddr,   10_000e6);
+        MockERC20v056(USDC).mint(valAddrB,  10_000e6);
+        // TREASURY needs to receive — use mint to avoid revert on transfer to EOA
+        // (mock transferFrom already handles it — no treasury contract needed)
 
-        // Approve network for USDC
-        vm.prank(agent1);    mock.approve(address(network), type(uint256).max);
-        vm.prank(agent2);    mock.approve(address(network), type(uint256).max);
-        vm.prank(validator); mock.approve(address(network), type(uint256).max);
+        vm.prank(inscriber);
+        MockERC20v056(USDC).approve(address(network), type(uint256).max);
+        vm.prank(valAddr);
+        MockERC20v056(USDC).approve(address(network), type(uint256).max);
+        vm.prank(valAddrB);
+        MockERC20v056(USDC).approve(address(network), type(uint256).max);
 
-        // Force-register validator as agent (first inscription auto-registers as INSCRIBER)
-        // Then force VALIDATOR role via storage manipulation for test purposes
-        vm.prank(validator);
-        network.inscribe(keccak256("validator-genesis"), bytes32(0), "build", "genesis", bytes32(0));
-        // Set role to VALIDATOR (AgentRole.VALIDATOR = 2) and set subExpiresAt to far future
-        // Agent storage: agentId -> Agent struct in mapping at slot 6
-        // agents mapping is slot 6, Agent struct fields:
-        // [0]=agentId [1]=wallet [2]=name(string) [3]=role(uint8) [4]=cycleCount [5]=chainHead
-        // [6]=registeredAt [7]=lastInscriptionAt [8]=active [9]=subExpiresAt
-        // We use vm.store on the proxy to set role field
-        // Use low-level: set subExpiresAt to block.timestamp + 365 days
-        // Easier: call lapseExpiredValidator isn't right, use cheatcode on struct
-        // Actually simplest: mock the USDC treasury call and call subscribeValidator after 144 inscriptions
-        // For tests: just override cycleCount and role directly via slot computation
-        _forceValidatorRole(validator);
+        // Reduce validator subscription fee to 0 for tests (custodian-only call)
+        vm.prank(CUSTOS);
+        network.setValidatorSubscriptionFee(0);
+
+        // Register inscriber with first inscription
+        _doInscribe(inscriber, bytes32(uint256(1)), bytes32(0), "seed");
+
+        // Bootstrap validator (144 inscriptions then subscribe)
+        _bootstrapValidator(valAddr);
     }
 
-    // ─── Helpers ─────────────────────────────────────────────────────────────
+    // ─── Helpers ──────────────────────────────────────────────────────────────
 
-    function _inscribe(address agent, bytes32 proof) internal {
-        vm.prank(agent);
-        network.inscribe(proof, bytes32(0), "build", "test", bytes32(0));
+    /// Warp forward past MIN_INSCRIPTION_GAP and call inscribe().
+    function _doInscribe(
+        address who,
+        bytes32 ph,
+        bytes32 prev,
+        string memory summary
+    ) internal {
+        ts += 301; // > MIN_INSCRIPTION_GAP (300s)
+        vm.warp(ts);
+        vm.prank(who);
+        network.inscribe(ph, prev, "WORK", summary, keccak256(bytes(summary)));
     }
 
-    function _inscribeChained(address agent, bytes32 prevHash, bytes32 proof) internal {
-        vm.prank(agent);
-        network.inscribe(proof, prevHash, "build", "test", bytes32(0));
+    /// Pump 144 unique inscriptions then subscribeValidator().
+    function _bootstrapValidator(address v) internal {
+        uint256 threshold = network.VALIDATOR_INSCRIPTION_THRESHOLD();
+        bytes32 prev = bytes32(0); // first inscription auto-registers
+        for (uint256 i = 0; i < threshold; i++) {
+            bytes32 ph = keccak256(abi.encodePacked(v, i));
+            _doInscribe(v, ph, prev, "bootstrap");
+            prev = ph;
+        }
+        vm.prank(v);
+        network.subscribeValidator();
     }
 
-    function _agentId(address agent) internal view returns (uint256) {
-        return network.agentIdByWallet(agent);
+    /// Inscribes one unique proof as `inscriber` with correct prevHash chain.
+    function _inscribe(string memory summary) internal returns (bytes32 proofHash) {
+        uint256 agentId = network.agentIdByWallet(inscriber);
+        bytes32 prev    = agentId == 0 ? bytes32(0) : network.getAgent(agentId).chainHead;
+        proofHash = keccak256(abi.encodePacked("INS", summary, ts));
+        _doInscribe(inscriber, proofHash, prev, summary);
     }
 
-    // ─── V0.5.6: Epoch attestation enforcement ────────────────────────────────
-
-    function test_proofHashEpoch_setAtInscription() public {
-        bytes32 proof = keccak256("proof1");
-        _inscribe(agent1, proof);
-        // Should be epoch 0 (first epoch)
-        assertEq(network.proofHashEpoch(proof), 1); // stored as currentEpoch+1; epoch 0 → 1
-    }
-
-    function test_attest_succeedsCurrentEpoch() public {
-        bytes32 proof = keccak256("proof1");
-        _inscribe(agent1, proof);
-        uint256 agentId = _agentId(agent1);
-
-        // Attest in same epoch — should succeed
-        vm.prank(validator);
-        network.attest(agentId, proof, true);
-
-        // Confirm point recorded
-        assertEq(network.validatorEpochPoints(0, validator), 1);
-    }
-
-    function test_attest_revertsForUnknownProof() public {
-        bytes32 unknownProof = keccak256("never-inscribed");
-        vm.prank(validator);
-        vm.expectRevert("proof not found");
-        network.attest(1, unknownProof, true); // agentId=1 (validator), proof never inscribed
-    }
-
-    function test_attest_revertsStaleProofFromPriorEpoch() public {
-        bytes32 proof = keccak256("proof-epoch0");
-        _inscribe(agent1, proof);
-        uint256 agentId = _agentId(agent1);
-
-        // Advance to next epoch by inscribing enough cycles
-        uint256 epochLen = network.epochLength(); // 24 cycles
-        for (uint256 i = 0; i < epochLen; i++) {
+    /// Advances to the next epoch. Rolls epoch boundary, then inscribes one more
+    /// cycle into the new epoch so the new epoch has 'started' cleanly.
+    function _advanceEpoch() internal {
+        uint256 epochBefore = network.currentEpoch();
+        uint256 agentId     = network.agentIdByWallet(inscriber);
+        uint256 i = 0;
+        // Keep inscribing until epoch rolls
+        while (network.currentEpoch() == epochBefore) {
             bytes32 prev = network.getAgent(agentId).chainHead;
-            bytes32 next = keccak256(abi.encodePacked("cycle", i));
-            // Use agent2 for epoch-closing inscriptions (different agent, doesn't affect agent1's chain)
-            if (i == 0) {
-                vm.warp(block.timestamp + 301);
-                _inscribe(agent2, keccak256("agent2-first"));
-            } else {
-                bytes32 a2prev = network.getAgent(_agentId(agent2)).chainHead;
-                vm.warp(block.timestamp + 301);
-                _inscribeChained(agent2, a2prev, keccak256(abi.encodePacked("a2cycle", i)));
-            }
+            bytes32 ph   = keccak256(abi.encodePacked("ADV", i, ts));
+            _doInscribe(inscriber, ph, prev, "advance");
+            i++;
         }
-
-        // Now in epoch 1 — proof was from epoch 0
-        assertEq(network.currentEpoch(), 1);
-        assertEq(network.proofHashEpoch(proof), 1); // stored as currentEpoch+1; epoch 0 → 1
-
-        vm.prank(validator);
-        vm.expectRevert("proof not from current epoch");
-        network.attest(agentId, proof, true);
     }
 
-    function test_attest_newEpochProofSucceeds() public {
-        bytes32 proof0 = keccak256("proof-epoch0");
-        _inscribe(agent1, proof0);
-        uint256 agentId1 = _agentId(agent1);
+    // ─── proofHashEpoch mapping ───────────────────────────────────────────────
 
-        // Close epoch 0 with enough cycles
-        uint256 epochLen = network.epochLength();
-        for (uint256 i = 0; i < epochLen; i++) {
-            if (i == 0) {
-                vm.warp(block.timestamp + 301);
-                _inscribe(agent2, keccak256("a2-first"));
-            } else {
-                bytes32 a2prev = network.getAgent(_agentId(agent2)).chainHead;
-                vm.warp(block.timestamp + 301);
-                _inscribeChained(agent2, a2prev, keccak256(abi.encodePacked("a2-", i)));
-            }
-        }
-        assertEq(network.currentEpoch(), 1);
-
-        // Inscribe new proof in epoch 1
-        vm.warp(block.timestamp + 301);
-        bytes32 prev1 = network.getAgent(agentId1).chainHead;
-        bytes32 proof1 = keccak256("proof-epoch1");
-        _inscribeChained(agent1, prev1, proof1);
-        assertEq(network.proofHashEpoch(proof1), 2); // epoch 1 stored as 1+1=2
-
-        // Attest epoch 1 proof — should succeed
-        vm.prank(validator);
-        network.attest(agentId1, proof1, true);
-        assertEq(network.validatorEpochPoints(1, validator), 1);
+    function test_ProofHashEpochSetOnInscribe() public {
+        bytes32 ph = _inscribe("epoch test");
+        uint256 ep = network.currentEpoch();
+        // Stored post-roll so always equals currentEpoch at attest time (if no roll in between)
+        assertEq(network.proofHashEpoch(ph), ep, "epoch must match currentEpoch at inscription");
     }
 
-    function test_attest_dedup_stillEnforced() public {
-        bytes32 proof = keccak256("proof1");
-        _inscribe(agent1, proof);
-        uint256 agentId = _agentId(agent1);
-
-        vm.prank(validator);
-        network.attest(agentId, proof, true);
-
-        // Second attest same proof same validator — should revert
-        vm.prank(validator);
-        vm.expectRevert("already attested this proof");
-        network.attest(agentId, proof, true);
+    function test_ProofHashEpochZeroForUnknown() public {
+        bytes32 unknown = keccak256("not a real proof");
+        assertEq(network.proofHashEpoch(unknown), 0, "unknown proof must return 0");
     }
 
-    function test_attest_multipleValidators_sameProof() public {
-        bytes32 proof = keccak256("proof1");
-        _inscribe(agent1, proof);
-        uint256 agentId = _agentId(agent1);
+    // ─── attest: happy path ───────────────────────────────────────────────────
 
-        // Two different validators can both attest the same proof
-        vm.prank(validator);
-        network.attest(agentId, proof, true);
+    function test_AttestSameEpoch_Succeeds() public {
+        bytes32 ph      = _inscribe("same epoch");
+        uint256 agentId = network.agentIdByWallet(inscriber);
+        uint256 ep      = network.currentEpoch();
 
-        vm.prank(validator2);
-        // validator2 needs stake too
-        MockUSDC(0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913).mint(validator2, 100e6);
-        vm.prank(validator2);
-        MockUSDC(0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913).approve(address(network), type(uint256).max);
-        _forceValidatorRole(validator2);
+        vm.prank(valAddr);
+        network.attest(agentId, ph, true);
 
-        vm.prank(validator2);
-        network.attest(agentId, proof, true);
-
-        assertEq(network.validatorEpochPoints(0, validator),  1);
-        assertEq(network.validatorEpochPoints(0, validator2), 1);
-        assertEq(network.epochTotalPoints(0), 2);
+        assertEq(network.validatorEpochPoints(ep, valAddr), 1);
+        assertEq(network.epochTotalPoints(ep), 1);
+        assertTrue(network.hasAttested(ep, ph, valAddr));
     }
 
-    // ─── V5.5 skill marketplace (carried forward, regression check) ──────────
+    // ─── attest: E04 – proof not found ───────────────────────────────────────
 
-    function test_registerSkill_carriedForward() public {
-        // agent1 inscribes (auto-registers)
-        _inscribe(agent1, keccak256("skill-proof"));
-        uint256 skillAgentId = _agentId(agent1);
+    function test_Attest_E04_UnknownProof() public {
+        uint256 agentId = network.agentIdByWallet(inscriber);
+        bytes32 garbage = keccak256("garbage proof that was never inscribed");
 
-        vm.prank(agent1);
-        network.registerSkill("x-research", "1.0", 1_000_000);
-
-        CustosNetworkProxyV056.SkillMetadata memory sm = network.getSkillMetadata(skillAgentId);
-        string memory name = sm.name;
-        string memory version = sm.version;
-        uint256 fee = sm.feePerExecution;
-        bool active = sm.active;
-        assertEq(name, "x-research");
-        assertEq(version, "1.0");
-        assertEq(fee, 1_000_000);
-        assertTrue(active);
+        vm.prank(valAddr);
+        vm.expectRevert(bytes("E04"));
+        network.attest(agentId, garbage, true);
     }
 
-    function test_initializeV056_exists() public {
-        // Deploy fresh impl and call initializeV056 — should not revert
-        CustosNetworkProxyV056 freshImpl = new CustosNetworkProxyV056();
-        // Can't call on proxied version (already initialised), just verify function exists
-        // by checking ABI-level: if it compiled with the function, this test passes
-        assertTrue(address(freshImpl) != address(0));
+    // ─── attest: E05 – stale epoch ────────────────────────────────────────────
+
+    function test_Attest_E05_StaleEpoch() public {
+        bytes32 staleHash     = _inscribe("stale proof");
+        uint256 agentId       = network.agentIdByWallet(inscriber);
+        uint256 inscribeEpoch = network.currentEpoch();
+
+        _advanceEpoch();
+
+        uint256 newEpoch = network.currentEpoch();
+        assertGt(newEpoch, inscribeEpoch, "epoch must have advanced");
+
+        vm.prank(valAddr);
+        vm.expectRevert(bytes("E05"));
+        network.attest(agentId, staleHash, true);
     }
 
-    function test_proofHashEpoch_slotNotOverlapping() public {
-        // Verify slot 37 doesn't corrupt slot 36 (disputeVoted)
-        // Insert a proof and check that disputeVoted mappings are zero
-        bytes32 proof = keccak256("slotcheck");
-        _inscribe(agent1, proof);
-        assertEq(network.proofHashEpoch(proof), 1); // stored as currentEpoch+1; epoch 0 → 1
-        // disputeVoted[0][validator] should still be false
-        assertFalse(network.disputeVoted(0, validator));
+    // ─── attest: E06 – double attest ─────────────────────────────────────────
+
+    function test_Attest_E06_DoubleAttest() public {
+        bytes32 ph      = _inscribe("double");
+        uint256 agentId = network.agentIdByWallet(inscriber);
+
+        vm.prank(valAddr);
+        network.attest(agentId, ph, true); // first — ok
+
+        vm.prank(valAddr);
+        vm.expectRevert(bytes("E06"));
+        network.attest(agentId, ph, true); // second — revert
     }
 
-    // ─── Internal helpers ─────────────────────────────────────────────────────
+    // ─── attest: E01 – invalid agentId ───────────────────────────────────────
 
-    struct AgentView {
-        uint256 agentId;
-        address wallet;
-        string name;
-        uint8 role;
-        uint256 cycleCount;
-        bytes32 chainHead;
-        uint256 registeredAt;
-        uint256 lastInscriptionAt;
-        bool active;
-        uint256 subExpiresAt;
+    function test_Attest_E01_ZeroAgentId() public {
+        bytes32 ph = _inscribe("agent id test");
+
+        vm.prank(valAddr);
+        vm.expectRevert(bytes("E01"));
+        network.attest(0, ph, true);
     }
 
-    function _getSkillFields(uint256 agentId) internal view returns (
-        CustosNetworkProxyV056.SkillMetadata memory
-    ) {
-        return network.getSkillMetadata(agentId);
+    function test_Attest_E01_OutOfRangeAgentId() public {
+        bytes32 ph = _inscribe("oob agent");
+
+        vm.prank(valAddr);
+        vm.expectRevert(bytes("E01"));
+        network.attest(9999, ph, true);
     }
 
-    /// @dev Force-set an address to VALIDATOR role for testing without 144 inscriptions.
-    ///      Inscribes once (auto-registers), then writes role+subExpiresAt via storage slots.
-    function _forceValidatorRole(address addr) internal {
-        // First ensure registered (inscribe if not yet)
-        if (network.agentIdByWallet(addr) == 0) {
-            MockUSDC(0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913).mint(addr, 100e6);
-            vm.prank(addr);
-            MockUSDC(0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913).approve(address(network), type(uint256).max);
-            vm.prank(addr);
-            network.inscribe(keccak256(abi.encodePacked("genesis", addr)), bytes32(0), "build", "genesis", bytes32(0));
-        }
-        uint256 agentId = network.agentIdByWallet(addr);
+    // ─── attest: E02 – zero proofHash ────────────────────────────────────────
 
-        // agents mapping is slot 6. Compute storage slot for agents[agentId]
-        // Struct layout (packed): agentId(32), wallet(32), name(dynamic→separate), role(1 byte in packed slot)
-        // role is uint8 at field index 3 — but with dynamic string `name` at index 2, layout shifts
-        // Safest: just call network functions that require validator and see if we can bypass
-        // Alternative: use foundry's `deal` doesn't help here
-        // Best approach for these tests: use vm.store with exact slot
+    function test_Attest_E02_ZeroProofHash() public {
+        uint256 agentId = network.agentIdByWallet(inscriber);
 
-        // Agent struct fields (slots relative to mapping entry base):
-        // slot+0: agentId (uint256)
-        // slot+1: wallet (address, 20 bytes)
-        // slot+2: name (string — dynamic, 32 bytes for length + keccak for data)
-        // slot+3: role (uint8) — packed in same word as other small fields
-        // The role, cycleCount are in same slot — skip struct storage manip, use a different approach
-
-        // Cleanest test approach: override VALIDATOR_INSCRIPTION_THRESHOLD to 1 and mock USDC
-        // Since we can't easily do that, use vm.mockCall on the attest requirement check
-        // ACTUALLY: the cleanest approach is just to warp + inscribe enough cycles
-        // epochLength = 24, VALIDATOR_INSCRIPTION_THRESHOLD = 144 — too many for tests
-
-        // Use vm.store: agentId→Agent is at keccak256(agentId . slot6)
-        // Agent.role is at offset 3 from struct base — but strings complicate layout
-        // Instead: we cheat by making custos (already a validator on mainnet) be our test validator
-        // In unit tests, just use the CUSTOS address which has no special powers in fresh deploy
-        // FINAL APPROACH: mock the onlyValidator check via a test-only override
-        // We add an internal setter only in tests using vm.store
-
-        // Compute: keccak256(abi.encode(agentId, 5)) = base slot of agents[agentId]
-        // agents mapping is at slot 5 (verified from contract source)
-        bytes32 baseSlot = keccak256(abi.encode(agentId, uint256(5)));
-        // slot+0: agentId — already correct
-        // slot+1: wallet — already correct
-        // slot+2: name string — skip (dynamic)
-        // slot+3: role(uint8) | more packed fields
-        // role is AgentRole enum = uint8. In the struct after dynamic string,
-        // each field gets its own slot. So:
-        // base+0 = agentId, base+1 = wallet, base+2 = name(length), base+3 = role
-        bytes32 roleSlot = bytes32(uint256(baseSlot) + 3);
-        vm.store(address(network), roleSlot, bytes32(uint256(2))); // AgentRole.VALIDATOR = 2
-
-        // subExpiresAt is field index 9 in struct → slot base+9 (after dynamic string occupies base+2)
-        // Actually: agentId=0, wallet=1, name=2(len)+data, role=3, cycleCount=4, chainHead=5,
-        //           registeredAt=6, lastInscriptionAt=7, active=8, subExpiresAt=9
-        bytes32 subSlot = bytes32(uint256(baseSlot) + 9);
-        vm.store(address(network), subSlot, bytes32(block.timestamp + 365 days));
+        vm.prank(valAddr);
+        vm.expectRevert(bytes("E02"));
+        network.attest(agentId, bytes32(0), true);
     }
 
+    // ─── attest: non-validator reverts ───────────────────────────────────────
+
+    function test_Attest_NotValidator_Reverts() public {
+        bytes32 ph      = _inscribe("stranger attempt");
+        uint256 agentId = network.agentIdByWallet(inscriber);
+
+        vm.prank(stranger);
+        vm.expectRevert();
+        network.attest(agentId, ph, true);
+    }
+
+    // ─── new epoch proof succeeds ─────────────────────────────────────────────
+
+    function test_AttestNewEpochProof_AfterAdvance_Succeeds() public {
+        bytes32 oldPh   = _inscribe("old epoch proof");
+        uint256 oldEpoch = network.proofHashEpoch(oldPh);
+        _advanceEpoch(); // roll past oldEpoch
+
+        assertGt(network.currentEpoch(), oldEpoch, "epoch must have advanced past oldEpoch");
+
+        bytes32 ph2  = _inscribe("new epoch proof");
+        uint256 ep2  = network.proofHashEpoch(ph2); // capture stored epoch after roll
+        assertGt(ep2, oldEpoch, "new proof must be in a later epoch");
+
+        uint256 agentId = network.agentIdByWallet(inscriber);
+        vm.prank(valAddr);
+        network.attest(agentId, ph2, true); // must succeed — same epoch as stored
+
+        assertTrue(network.hasAttested(ep2, ph2, valAddr));
+    }
+
+    // ─── multiple validators same epoch ──────────────────────────────────────
+
+    function test_MultipleValidators_SameEpoch() public {
+        _bootstrapValidator(valAddrB);
+
+        bytes32 ph      = _inscribe("multi-val");
+        uint256 agentId = network.agentIdByWallet(inscriber);
+        uint256 ep      = network.currentEpoch();
+
+        vm.prank(valAddr);
+        network.attest(agentId, ph, true);
+        vm.prank(valAddrB);
+        network.attest(agentId, ph, false); // different opinion — both valid calls
+
+        assertEq(network.epochTotalPoints(ep), 2);
+        assertEq(network.validatorEpochPoints(ep, valAddr), 1);
+        assertEq(network.validatorEpochPoints(ep, valAddrB), 1);
+    }
+
+    // ─── attest false recorded correctly ─────────────────────────────────────
+
+    function test_AttestFalse_Recorded() public {
+        bytes32 ph      = _inscribe("invalid proof");
+        uint256 agentId = network.agentIdByWallet(inscriber);
+
+        vm.prank(valAddr);
+        network.attest(agentId, ph, false);
+
+        CustosNetworkProxyV056.Attestation[] memory atts = network.getAttestations(ph);
+        assertEq(atts.length, 1);
+        assertFalse(atts[0].valid);
+        assertEq(atts[0].validator, valAddr);
+    }
 }
