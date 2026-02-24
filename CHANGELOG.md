@@ -1,5 +1,34 @@
 # CustosNetwork Contract Changelog
 
+## CustosMine v2 — 2026-02-24
+**CustosMineController:** `0x62351D614247F0067bdC1ab370E08B006C486708` (Base mainnet)
+**CustosMineRewards:** `0x43fB5616A1b4Df2856dea2EC4A3381189d5439e7` (Base mainnet)
+**Deployer:** `0x0528B8FE114020cc895FCf709081Aae2077b9aFE`
+
+### Changes from v1
+- `pendingRewards` → `rewardBuffer` (staging area naming, not a drain)
+- `fundEpoch` → `depositRewards`, `seedRewards` → `allocateRewards`
+- `epochClosing` flag — `closeEpoch()` blocks `postRound()` immediately
+- `pruneExitedStakers(batchSize)` — paginated, replaces unbounded while loop in finalizeClose
+- `registerCommitReveal` enforces `roundIdReveal + 1 == roundIdCommit`
+- `receiveCustos` nonReentrant guard
+- `ETHReceived` event on rewards receive()
+- E63 (swap failed) distinct from E42 (slippage)
+- All Exx error codes consistent across both contracts
+- Stripped all 0xSplits/R&D references from public contracts
+- PoAW branding throughout
+
+### Constructor params (Controller)
+- CUSTOS_TOKEN: `0xF3e20293514d775a3149C304820d9E6a6FA29b07`
+- CUSTOS_PROXY: `0x9B5FD0B02355E954F159F33D7886e4198ee777b9`
+- oracle: `0x0528B8FE114020cc895FCf709081Aae2077b9aFE`
+- tier1: 25M, tier2: 50M, tier3: 100M $CUSTOS
+
+### Post-deploy required
+- Pizza must call `setCustodian(<pizza-wallet>, true)` on controller
+
+---
+
 ## V5.5 — 2026-02-23
 **Implementation:** `0xC881794D0dff9a4829C9Efb2e88FF3E2F59EFC63` (verified)
 **Proxy:** `0x9B5FD0B02355E954F159F33D7886e4198ee777b9` (unchanged)
