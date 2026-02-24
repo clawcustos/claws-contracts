@@ -153,6 +153,11 @@ contract CustosNetworkProxyV056 is
     ///         at the time of inscription. proofHashEpoch[hash] == 0 means never inscribed.
     mapping(bytes32 => uint256) public proofHashEpoch;               // slot 30
 
+    // ── Slot 31: V0.5.6 reverse lookup — inscriptionId → proofHash ───────────
+    /// @notice Enables ContentRevealed event to emit the actual proofHash.
+    ///         Set at inscription time alongside proofHashToInscriptionId.
+    mapping(uint256 => bytes32) public inscriptionProofHash;         // slot 31
+
     // ─── Events ──────────────────────────────────────────────────────────────
 
     event AgentRegistered(uint256 indexed agentId, address indexed wallet, string name);
@@ -322,6 +327,7 @@ contract CustosNetworkProxyV056 is
         uint256 inscriptionId = inscriptionCount;
         inscriptionContentHash[inscriptionId] = contentHash;
         proofHashToInscriptionId[proofHash]   = inscriptionId;
+        inscriptionProofHash[inscriptionId]   = proofHash;
         inscriptionAgent[inscriptionId]       = msg.sender;
 
         emit ProofInscribed(agentId, proofHash, prevHash, blockType, summary, agent.cycleCount, contentHash, inscriptionId);
@@ -377,9 +383,7 @@ contract CustosNetworkProxyV056 is
         inscriptionRevealed[inscriptionId]        = true;
         inscriptionRevealedContent[inscriptionId] = content;
 
-        // Reverse lookup to get proofHash for event
-        // (we can derive it from storage but it's cheaper to just emit inscriptionId)
-        emit ContentRevealed(inscriptionId, bytes32(0), content);
+        emit ContentRevealed(inscriptionId, inscriptionProofHash[inscriptionId], content);
     }
 
     /**
@@ -646,17 +650,15 @@ contract CustosNetworkProxyV056 is
         // Snapshot before
         uint256 custosBefore = IERC20(CUSTOS_TOKEN).balanceOf(address(this));
 
-        // Execute swap
+        // Execute swap — clear approval regardless of outcome (no dangling allowance)
         (bool success,) = swapTarget.call(swapData);
+        IERC20(USDC).approve(ALLOWANCE_HOLDER, 0);
         require(success, "E52");
 
         // Verify received amount
         uint256 custosAfter    = IERC20(CUSTOS_TOKEN).balanceOf(address(this));
         uint256 custosReceived = custosAfter - custosBefore;
         require(custosReceived >= minCustosOut, "E48");
-
-        // Reset any leftover allowance
-        IERC20(USDC).approve(ALLOWANCE_HOLDER, 0);
 
         // Send $CUSTOS to ecosystem wallet — NOT burned
         IERC20(CUSTOS_TOKEN).safeTransfer(ECOSYSTEM_WALLET, custosReceived);
@@ -671,6 +673,12 @@ contract CustosNetworkProxyV056 is
      */
     function withdrawToTreasury(address token, uint256 amount) external onlyCustodian nonReentrant {
         require(amount > 0, "E11");
+        // If recovering USDC, protect validator pool + buyback pool from being swept
+        if (token == USDC) {
+            uint256 locked = validatorPool + buybackPool;
+            uint256 bal = IERC20(USDC).balanceOf(address(this));
+            require(bal >= locked + amount, "E49");
+        }
         IERC20(token).safeTransfer(TREASURY, amount);
     }
 
