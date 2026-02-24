@@ -204,16 +204,16 @@ contract MineControllerEpochTest is MineTestBase {
     }
 
     function test_openEpoch_drainsPendingRewards() public {
-        // Seed 500k CUSTOS into pendingRewards via custodian seed
+        // Seed 500k CUSTOS into rewardBuffer via custodian seed
         custos.mint(address(controller), 500_000e18);
         controller.setCustodian(custodian, true);
         vm.prank(custodian);
-        controller.seedRewards(500_000e18);
+        controller.allocateRewards(500_000e18);
 
         _openEpoch();
         CustosMineController.Epoch memory e = controller.getEpoch(1);
         assertEq(e.rewardPool, 500_000e18);
-        assertEq(controller.pendingRewards(), 0);
+        assertEq(controller.rewardBuffer(), 0);
     }
 
     function test_openEpoch_revertsIfAlreadyOpen() public {
@@ -520,7 +520,7 @@ contract MineControllerClaimTest is MineTestBase {
         // Seed reward pool
         custos.mint(address(controller), POOL);
         vm.prank(custodian);
-        controller.seedRewards(POOL);
+        controller.allocateRewards(POOL);
 
         _stakeMiner(miner1, T1); // tier1 = 1 credit
         _stakeMiner(miner2, T2); // tier2 = 2 credits
@@ -612,18 +612,18 @@ contract MineControllerSeedTest is MineTestBase {
         controller.setCustodian(custodian, true);
     }
 
-    function test_seedRewards_addsToPending() public {
+    function test_allocateRewards_addsToPending() public {
         uint256 amt = 500_000e18;
         custos.mint(address(controller), amt);
         vm.prank(custodian);
-        controller.seedRewards(amt);
-        assertEq(controller.pendingRewards(), amt);
+        controller.allocateRewards(amt);
+        assertEq(controller.rewardBuffer(), amt);
     }
 
-    function test_seedRewards_revertsInsufficientBalance() public {
+    function test_allocateRewards_revertsInsufficientBalance() public {
         vm.prank(custodian);
         vm.expectRevert(bytes("E48"));
-        controller.seedRewards(1e18);
+        controller.allocateRewards(1e18);
     }
 
     function test_receiveCustos_onlyFromRewardsContract() public {
@@ -634,7 +634,7 @@ contract MineControllerSeedTest is MineTestBase {
     function test_receiveCustos_addsToPending() public {
         vm.prank(address(rewards));
         controller.receiveCustos(100e18);
-        assertEq(controller.pendingRewards(), 100e18);
+        assertEq(controller.rewardBuffer(), 100e18);
     }
 }
 
@@ -710,8 +710,8 @@ contract CustosMineRewardsTest is MineTestBase {
         vm.prank(oracle);
         rewards.swapAndSend(bytes(""), custosOut); // empty calldata hits fallback
 
-        // Controller received CUSTOS into pendingRewards
-        assertEq(controller.pendingRewards(), custosOut);
+        // Controller received CUSTOS into rewardBuffer
+        assertEq(controller.rewardBuffer(), custosOut);
         // WETH drained from rewards (transferred to mock zeroEx)
         assertEq(weth.balanceOf(address(rewards)), 0);
         assertEq(weth.balanceOf(address(zeroEx)), wethAmt);
@@ -779,15 +779,15 @@ contract MineControllerSecurityTest is MineTestBase {
     }
 
     // FIX2: seedRewards double-seed should revert
-    function test_seedRewards_preventsDoubleSeed() public {
+    function test_allocateRewards_preventsDoubleSeed() public {
         uint256 amt = 500_000e18;
         custos.mint(address(controller), amt);
         vm.prank(custodian);
-        controller.seedRewards(amt);
-        // pendingRewards = amt, balance = amt. No free balance left.
+        controller.allocateRewards(amt);
+        // rewardBuffer = amt, balance = amt. No free balance left.
         vm.prank(custodian);
         vm.expectRevert(bytes("E48"));
-        controller.seedRewards(1); // nothing left to seed
+        controller.allocateRewards(1); // nothing left to seed
     }
 
     // FIX3: receiveCustos reverts if custosMineRewards is address(0)

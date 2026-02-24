@@ -2,128 +2,153 @@
 pragma solidity ^0.8.25;
 
 /**
- * @title CustosMineController
- * @notice Staking-based mining controller for $CUSTOS token rewards
- * 
- * Flow:
- * 0xSplits R&D → CustosMineRewards (WETH)
- *   → swapAndSend() → $CUSTOS → receiveCustos() → pendingRewards
- *   → openEpoch() → epoch.rewardPool + tier snapshots taken
- *   → 140 rounds: postRound / commit / reveal / settleRound (10min loops)
- *   → closeEpoch() → epoch.settled, pending tiers applied
- *   → claimEpochReward() → $CUSTOS to participant
- *   → sweepExpiredClaims() → unclaimed → pendingRewards → next epoch
+ * @title CustosMineController v2
+ * @notice Proof-of-intelligence mining via CustosNetwork inscriptions.
+ *
+ * Agents participate by inscribing on CustosNetworkProxy each loop:
+ *   blockType:   "mine-commit"  (loop N)   contentHash = keccak256(answer|salt)
+ *   blockType:   "mine-reveal"  (loop N+1) contentHash = keccak256(answer|salt|commitInscriptionId)
+ *
+ * Each 10-min loop an agent calls ONE of:
+ *   registerCommit(roundId, inscriptionId)                              — round 1 only
+ *   registerCommitReveal(roundIdN, insIdN, roundIdN1, answer, salt)    — rounds 2-139
+ *   registerReveal(roundId, answer, salt)                              — round 140 only
+ *
+ * On-chain verification in registerCommitReveal / registerReveal:
+ *   keccak256(abi.encodePacked(answer, salt)) == proxy.inscriptionContentHash(commitInscriptionId)
+ *
+ * Oracle role: postRound() + settleRound() only. No commit/reveal handling.
+ *
+ * Error codes (E01-E62):
+ *   E10 No epoch    E11 Already open   E12 Not staked    E13 Below tier1
+ *   E14 Bad window  E15 Already done   E16 Wrong agent   E17 Hash mismatch
+ *   E18 Too many    E19 Not revealed   E20 Not settled   E21 Claimed
+ *   E22 Expired     E23 No credits     E24 Not oracle    E25 Not custodian
+ *   E26 Not owner   E27 Paused        E28 Reentrant     E29 Zero addr
+ *   E30 Zero amt    E31 Bad tiers     E32 Snapshot pend  E33 Snap done
+ *   E34 Bad batch   E35 Credits pend   E36 No stakers    E37 No stake
+ *   E38 No queue    E39 Not ended     E40 Bad round     E41 No rewards
+ *   E42 Slippage    E43 Deadline      E44 Only rewards   E45 Gap
+ *   E46 No ETH      E47 ETH fail      E48 Insufficient   E49 No unclaimed
+ *   E50 Snap not done E51 Not expired  E52 Batch settling E53 Empty batch
+ *   E54 Cross epoch  E55 Snap cursor   E56 Bad epoch dur  E57 No commit
+ *   E58 Wrong round  E59 Zero insId   E60 Not mine insId E61 Insid agent  E62 commit window
  */
+
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-/// @notice CustosMineController manages staking, epochs, rounds, and reward distribution
+/// @dev Minimal interface to CustosNetworkProxy for inscription verification
+interface ICustosProxy {
+    function inscriptionContentHash(uint256 inscriptionId) external view returns (bytes32);
+    function inscriptionAgent(uint256 inscriptionId) external view returns (address);
+    function agentIdByWallet(address wallet) external view returns (uint256);
+}
+
 contract CustosMineController {
     using SafeERC20 for IERC20;
 
     // ============ Constants ============
-    uint256 public constant COMMIT_WINDOW = 600;  // 10 min — agents commit during loop N
-    uint256 public constant REVEAL_WINDOW = 600;  // 10 min — agents reveal during loop N+1 (same duration, overlaps with next commit)
-    uint256 public constant EPOCH_DURATION = 86400;
-    uint256 public constant CLAIM_WINDOW = 30 days;
+    uint256 public constant COMMIT_WINDOW         = 600;
+    uint256 public constant REVEAL_WINDOW         = 600;
+    uint256 public constant EPOCH_DURATION        = 86400;
+    uint256 public constant CLAIM_WINDOW          = 30 days;
     uint256 public constant MAX_REVEALERS_PER_ROUND = 500;
+    uint256 public constant ROUNDS_PER_EPOCH      = 140;
 
-    // Reentrancy guard
     uint256 private constant _NOT_ENTERED = 1;
-    uint256 private constant _ENTERED = 2;
+    uint256 private constant _ENTERED     = 2;
     uint256 private _reentrancyStatus;
 
-    // ============ State Variables ============
+    // ============ State ============
     address public owner;
     mapping(address => bool) public custodians;
     address public oracle;
     address public custosMineRewards;
     address public immutable CUSTOS_TOKEN;
+    address public immutable CUSTOS_PROXY;
 
-    bool public paused;
-    bool public epochOpen;
+    bool    public paused;
+    bool    public epochOpen;
     uint256 public currentEpochId;
     uint256 public roundCount;
-    uint256 public pendingRewards;
+    /// @dev $CUSTOS staged here between receipt and next epoch open. Moves to epoch.rewardPool at openEpoch().
+    uint256 public rewardBuffer;
 
-    // Tier thresholds
     uint256 public tier1Threshold;
     uint256 public tier2Threshold;
     uint256 public tier3Threshold;
     uint256 public pendingTier1;
     uint256 public pendingTier2;
     uint256 public pendingTier3;
-    bool public tierChangePending;
+    bool    public tierChangePending;
 
-    // Staking
     struct StakePosition {
         uint256 amount;
-        bool withdrawalQueued;
+        bool    withdrawalQueued;
         uint256 unstakeEpochId;
-        uint256 stakedIndex; // index in stakedAgents[] — enables O(1) removal
+        uint256 stakedIndex;
     }
     mapping(address => StakePosition) public stakes;
     address[] public stakedAgents;
     mapping(address => bool) public isStaked;
 
-    // Snapshots: epochId => wallet => tier
     mapping(uint256 => mapping(address => uint256)) public tierSnapshot;
 
-    // Epochs + Rounds + Submissions
     struct Epoch {
         uint256 epochId;
         uint256 startAt;
         uint256 endAt;
         uint256 rewardPool;
         uint256 totalCredits;
-        bool settled;
+        bool    settled;
         uint256 claimDeadline;
     }
+
     struct Round {
         uint256 roundId;
         uint256 epochId;
         uint256 commitOpenAt;
         uint256 commitCloseAt;
         uint256 revealCloseAt;
-        bytes32 answerHash; // immutable after postRound
-        string questionUri;
-        bool settled;
-        bool expired;
-        bool batchSettling; // true while settleBatch is in progress
-        string revealedAnswer;
+        bytes32 answerHash;
+        string  questionUri;
+        bool    settled;
+        bool    expired;
+        bool    batchSettling;
+        string  revealedAnswer;
         uint256 correctCount;
         uint256 revealCount;
     }
+
+    /// @dev Per-agent per-round: stores commitInscriptionId and revealed answer
     struct Submission {
-        bytes32 commitHash;
-        string revealedAnswer;
-        bool committed;
-        bool revealed;
-        bool credited;
-        uint256 tierAtCommit;
+        uint256 commitInscriptionId; // inscriptionId from agent's mine-commit inscription
+        string  revealedAnswer;
+        bool    committed;
+        bool    revealed;
+        bool    credited;
     }
 
-    mapping(uint256 => Epoch) public epochs;
-    mapping(uint256 => Round) public rounds;
-    mapping(uint256 => mapping(address => Submission)) public submissions;
-    mapping(uint256 => address[]) internal _pendingReveals;
+    mapping(uint256 => Epoch)                              public epochs;
+    mapping(uint256 => Round)                              public rounds;
+    mapping(uint256 => mapping(address => Submission))    public submissions;
+    mapping(uint256 => address[])                         internal _pendingReveals;
 
-    // Epoch open pagination (snapshot)
-    uint256 public snapshotCursor;   // index into stakedAgents[] — 0 = not started
-    bool public snapshotComplete;    // true once all agents snapshotted
-    uint256 public creditCursor;     // index for batched credit sum at closeEpoch
-
-    // Credits + Claims
     mapping(uint256 => mapping(address => uint256)) public epochCredits;
-    mapping(uint256 => mapping(address => bool)) public epochClaimed;
-    mapping(uint256 => uint256) public epochClaimedAmount;
+    mapping(uint256 => mapping(address => bool))    public epochClaimed;
+    mapping(uint256 => uint256)                     public epochClaimedAmount;
+
+    uint256 public snapshotCursor;
+    bool    public snapshotComplete;
+    uint256 public creditCursor;
 
     // ============ Events ============
     event EpochOpened(uint256 indexed epochId, uint256 startAt, uint256 endAt, uint256 rewardPool);
     event EpochClosed(uint256 indexed epochId, uint256 totalCredits, uint256 rewardPool);
     event RoundPosted(uint256 indexed roundId, string questionUri, uint256 commitOpenAt, uint256 commitCloseAt, uint256 revealCloseAt);
-    event CommitSubmitted(uint256 indexed roundId, address indexed wallet, uint256 tier);
-    event RevealSubmitted(uint256 indexed roundId, address indexed wallet);
+    event CommitRegistered(uint256 indexed roundId, address indexed wallet, uint256 inscriptionId);
+    event RevealRegistered(uint256 indexed roundId, address indexed wallet);
     event RoundSolved(uint256 indexed roundId, address indexed wallet, uint256 credits);
     event RoundSettled(uint256 indexed roundId, string correctAnswer, uint256 correctCount, uint256 totalReveals);
     event RoundExpired(uint256 indexed roundId);
@@ -144,33 +169,12 @@ contract CustosMineController {
     event Unpaused();
 
     // ============ Modifiers ============
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Ownable: caller is not owner");
-        _;
-    }
-
-    modifier onlyCustodian() {
-        require(custodians[msg.sender], "Not custodian");
-        _;
-    }
-
-    modifier onlyOracle() {
-        require(msg.sender == oracle, "Not oracle");
-        _;
-    }
-
-    modifier onlyAuthorised() {
-        require(msg.sender == oracle || custodians[msg.sender], "Not authorised");
-        _;
-    }
-
-    modifier notPaused() {
-        require(!paused, "Paused");
-        _;
-    }
-
-    modifier nonReentrant() {
-        require(_reentrancyStatus != _ENTERED, "ReentrancyGuard: reentrant call");
+    modifier onlyOwner()      { require(msg.sender == owner,           "E26"); _; }
+    modifier onlyCustodian()  { require(custodians[msg.sender],        "E25"); _; }
+    modifier onlyOracle()     { require(msg.sender == oracle,          "E24"); _; }
+    modifier notPaused()      { require(!paused,                       "E27"); _; }
+    modifier nonReentrant()   {
+        require(_reentrancyStatus != _ENTERED, "E28");
         _reentrancyStatus = _ENTERED;
         _;
         _reentrancyStatus = _NOT_ENTERED;
@@ -179,853 +183,592 @@ contract CustosMineController {
     // ============ Constructor ============
     constructor(
         address _custosToken,
+        address _custosProxy,
         address _custosMineRewards,
         address _oracle,
         uint256 _tier1,
         uint256 _tier2,
         uint256 _tier3
     ) {
-        require(_custosToken != address(0), "zero token");
-        require(_oracle != address(0), "zero oracle");
-        require(_tier1 > 0 && _tier1 < _tier2 && _tier2 < _tier3, "invalid tiers");
-        owner = msg.sender;
-        CUSTOS_TOKEN = _custosToken;
-        custosMineRewards = _custosMineRewards; // can be address(0) — set post-deploy
-        oracle = _oracle;
-        
-        tier1Threshold = _tier1;
-        tier2Threshold = _tier2;
-        tier3Threshold = _tier3;
-        
+        require(_custosToken  != address(0), "E29");
+        require(_custosProxy  != address(0), "E29");
+        require(_oracle       != address(0), "E29");
+        require(_tier1 > 0 && _tier1 < _tier2 && _tier2 < _tier3, "E31");
+
+        owner             = msg.sender;
+        CUSTOS_TOKEN      = _custosToken;
+        CUSTOS_PROXY      = _custosProxy;
+        custosMineRewards = _custosMineRewards;
+        oracle            = _oracle;
+        tier1Threshold    = _tier1;
+        tier2Threshold    = _tier2;
+        tier3Threshold    = _tier3;
         _reentrancyStatus = _NOT_ENTERED;
     }
 
-    // ============ Staking Functions ============
-    
-    /**
-     * @notice Stake $CUSTOS tokens to participate in mining
-     * @param amount Amount of tokens to stake (must be >= tier1Threshold)
-     */
+    // ============ Staking ============
+
     function stake(uint256 amount) external notPaused nonReentrant {
-        require(amount >= tier1Threshold, "Amount below tier1");
-        
+        require(amount >= tier1Threshold, "E13");
         IERC20(CUSTOS_TOKEN).safeTransferFrom(msg.sender, address(this), amount);
-        
-        StakePosition storage position = stakes[msg.sender];
-        position.amount += amount;
-        
+        StakePosition storage pos = stakes[msg.sender];
+        pos.amount += amount;
         if (!isStaked[msg.sender]) {
-            isStaked[msg.sender] = true;
-            stakes[msg.sender].stakedIndex = stakedAgents.length;
+            isStaked[msg.sender]  = true;
+            pos.stakedIndex       = stakedAgents.length;
             stakedAgents.push(msg.sender);
         }
-        
-        uint256 tier = _getTierFromBalance(position.amount);
-        emit Staked(msg.sender, amount, tier);
+        emit Staked(msg.sender, amount, _getTier(pos.amount));
     }
 
-    /**
-     * @notice Queue stake for withdrawal at end of current epoch
-     */
     function unstake() external notPaused {
-        require(isStaked[msg.sender], "Not staked");
-        require(!stakes[msg.sender].withdrawalQueued, "Already queued");
-        
+        require(isStaked[msg.sender],              "E37");
+        require(!stakes[msg.sender].withdrawalQueued, "E15");
         stakes[msg.sender].withdrawalQueued = true;
-        stakes[msg.sender].unstakeEpochId = currentEpochId;
-        
+        stakes[msg.sender].unstakeEpochId   = currentEpochId;
         emit Unstaked(msg.sender, currentEpochId);
     }
 
-    /**
-     * @notice Cancel pending withdrawal
-     */
     function cancelUnstake() external notPaused {
-        require(stakes[msg.sender].withdrawalQueued, "No withdrawal queued");
-        
+        require(stakes[msg.sender].withdrawalQueued, "E38");
         stakes[msg.sender].withdrawalQueued = false;
-        stakes[msg.sender].unstakeEpochId = 0;
-        
+        stakes[msg.sender].unstakeEpochId   = 0;
         emit UnstakeCancelled(msg.sender);
     }
 
-    /**
-     * @notice Withdraw stake after unstake epoch has ended
-     */
     function withdrawStake() external nonReentrant {
-        StakePosition storage position = stakes[msg.sender];
-        require(position.amount > 0, "No stake");
-        require(position.withdrawalQueued, "No withdrawal queued");
-        
-        uint256 unstakeEpoch = position.unstakeEpochId;
-        // Must wait until the epoch queued for has ended:
-        // - If unstakeEpoch == 0 (queued before first epoch), wait until epoch 1 is closed
-        // - If unstakeEpoch > 0, wait until that epoch's endAt has passed AND no epoch is open
-        if (unstakeEpoch == 0) {
-            require(!epochOpen && currentEpochId > 0, "Epoch not ended");
+        StakePosition storage pos = stakes[msg.sender];
+        require(pos.amount > 0,             "E37");
+        require(pos.withdrawalQueued,       "E38");
+        uint256 ue = pos.unstakeEpochId;
+        if (ue == 0) {
+            require(!epochOpen && currentEpochId > 0, "E39");
         } else {
-            require(!epochOpen && epochs[unstakeEpoch].settled, "Epoch not ended");
+            require(!epochOpen && epochs[ue].settled, "E39");
         }
-        
-        uint256 amount = position.amount;
-        
-        // CEI: clear state before transfer
-        position.amount = 0;
-        position.withdrawalQueued = false;
-        position.unstakeEpochId = 0;
+        uint256 amount = pos.amount;
+        pos.amount           = 0;
+        pos.withdrawalQueued = false;
+        pos.unstakeEpochId   = 0;
         isStaked[msg.sender] = false;
-        
-        // Remove from stakedAgents (skip if already auto-removed by finalizeClose)
-        if (position.stakedIndex != type(uint256).max) {
+        if (pos.stakedIndex != type(uint256).max) {
             _removeFromStakedAgents(msg.sender);
         } else {
-            position.stakedIndex = 0; // clear sentinel
+            pos.stakedIndex = 0;
         }
-        
         IERC20(CUSTOS_TOKEN).safeTransfer(msg.sender, amount);
-        
         emit StakeWithdrawn(msg.sender, amount);
     }
 
     function _removeFromStakedAgents(address wallet) internal {
-        uint256 idx = stakes[wallet].stakedIndex;
+        uint256 idx  = stakes[wallet].stakedIndex;
         uint256 last = stakedAgents.length - 1;
         if (idx != last) {
-            address moved = stakedAgents[last];
-            stakedAgents[idx] = moved;
-            stakes[moved].stakedIndex = idx; // update moved agent's index
+            address moved        = stakedAgents[last];
+            stakedAgents[idx]    = moved;
+            stakes[moved].stakedIndex = idx;
         }
         stakedAgents.pop();
         stakes[wallet].stakedIndex = 0;
     }
 
-    // ============ Participation Functions ============
+    // ============ Participation — CustosNetwork inscription-based ============
 
     /**
-     * @notice Submit commit hash for a round
-     * @param roundId Round to commit to
-     * @param commitHash Hash of (answer + salt)
+     * @notice Round 1 only — register a commit inscription, nothing to reveal yet.
+     * @param roundId         Must be round 1 of the epoch (roundCount == 1)
+     * @param inscriptionId   The inscriptionId from agent's "mine-commit" inscription this loop
+     *
+     * Agent must have already called proxy.inscribe() this loop with:
+     *   blockType:   "mine-commit"
+     *   contentHash: keccak256(abi.encodePacked(answer_for_roundId, salt))
      */
-    function commit(uint256 roundId, bytes32 commitHash) external notPaused {
-        require(epochOpen, "No epoch open");
-        require(tierSnapshot[currentEpochId][msg.sender] > 0, "Not staked for epoch");
-        require(rounds[roundId].epochId == currentEpochId, "Round not in current epoch");
-        require(rounds[roundId].commitOpenAt <= block.timestamp, "Commit not open");
-        require(rounds[roundId].commitCloseAt > block.timestamp, "Commit closed");
-        
+    function registerCommit(
+        uint256 roundId,
+        uint256 inscriptionId
+    ) external notPaused {
+        _validateCommit(roundId, inscriptionId);
         Submission storage sub = submissions[roundId][msg.sender];
-        require(!sub.committed, "Already committed");
-        
-        sub.committed = true;
-        sub.commitHash = commitHash;
-        sub.tierAtCommit = tierSnapshot[currentEpochId][msg.sender];
-        
-        emit CommitSubmitted(roundId, msg.sender, sub.tierAtCommit);
+        sub.commitInscriptionId = inscriptionId;
+        sub.committed           = true;
+        emit CommitRegistered(roundId, msg.sender, inscriptionId);
     }
 
     /**
-     * @notice Reveal answer for a round
-     * @param roundId Round to reveal for
-     * @param answer Answer string
-     * @param salt Salt used in commit
+     * @notice Rounds 2-139 — commit to roundIdCommit AND reveal roundIdReveal in one tx.
+     * @param roundIdCommit   Current round N (commit window open)
+     * @param inscriptionId   inscriptionId from agent's "mine-commit" inscription this loop
+     * @param roundIdReveal   Previous round N-1 (reveal window open)
+     * @param answer          Plaintext answer for roundIdReveal
+     * @param salt            Salt used when committing to roundIdReveal
+     *
+     * Verification: keccak256(answer|salt) must match the contentHash stored on-chain
+     * for the commit inscription registered in roundIdReveal.
      */
-    function reveal(uint256 roundId, string calldata answer, bytes32 salt) external notPaused {
-        require(epochOpen, "No epoch open");
-        require(rounds[roundId].commitCloseAt <= block.timestamp, "Commit still open");
-        require(rounds[roundId].revealCloseAt > block.timestamp, "Reveal closed");
-        
+    function registerCommitReveal(
+        uint256 roundIdCommit,
+        uint256 inscriptionId,
+        uint256 roundIdReveal,
+        string calldata answer,
+        bytes32 salt
+    ) external notPaused {
+        require(roundIdReveal + 1 == roundIdCommit, "E45");
+        _validateCommit(roundIdCommit, inscriptionId);
+        _validateReveal(roundIdReveal, answer, salt);
+
+        // Store commit
+        Submission storage subC = submissions[roundIdCommit][msg.sender];
+        subC.commitInscriptionId = inscriptionId;
+        subC.committed           = true;
+
+        // Store reveal
+        Submission storage subR = submissions[roundIdReveal][msg.sender];
+        subR.revealedAnswer = answer;
+        subR.revealed       = true;
+        _pendingReveals[roundIdReveal].push(msg.sender);
+
+        emit CommitRegistered(roundIdCommit, msg.sender, inscriptionId);
+        emit RevealRegistered(roundIdReveal, msg.sender);
+    }
+
+    /**
+     * @notice Round 140 only — reveal previous round, no new commit needed.
+     * @param roundId   Round N-1 to reveal (must be in reveal window)
+     * @param answer    Plaintext answer
+     * @param salt      Salt used at commit time
+     */
+    function registerReveal(
+        uint256 roundId,
+        string calldata answer,
+        bytes32 salt
+    ) external notPaused {
+        _validateReveal(roundId, answer, salt);
         Submission storage sub = submissions[roundId][msg.sender];
-        require(sub.committed, "Not committed");
-        require(!sub.revealed, "Already revealed");
-        
-        // Verify commit hash
-        require(keccak256(abi.encodePacked(answer, salt)) == sub.commitHash, "Hash mismatch");
-        
-        // Cap pending reveals
-        require(_pendingReveals[roundId].length < MAX_REVEALERS_PER_ROUND, "Too many reveals");
-        
-        sub.revealed = true;
         sub.revealedAnswer = answer;
-        
+        sub.revealed       = true;
         _pendingReveals[roundId].push(msg.sender);
-        
-        emit RevealSubmitted(roundId, msg.sender);
+        emit RevealRegistered(roundId, msg.sender);
     }
 
-    /**
-     * @notice Claim rewards for an epoch
-     * @param epochId Epoch to claim for
-     */
+    // ── internal validation helpers ────────────────────────────────────
+
+    function _validateCommit(uint256 roundId, uint256 inscriptionId) internal view {
+        require(epochOpen,                                    "E10");
+        require(snapshotComplete,                             "E50");
+        require(inscriptionId != 0,                          "E59");
+        Round storage r = rounds[roundId];
+        require(r.roundId == roundId && r.epochId == currentEpochId, "E58");
+        require(
+            block.timestamp >= r.commitOpenAt &&
+            block.timestamp <  r.commitCloseAt,              "E62");
+        require(!r.settled && !r.expired,                    "E40");
+        require(tierSnapshot[currentEpochId][msg.sender] > 0,"E12");
+        require(!submissions[roundId][msg.sender].committed, "E15");
+
+        // Verify inscription belongs to this agent on CustosProxy
+        require(
+            ICustosProxy(CUSTOS_PROXY).inscriptionAgent(inscriptionId) == msg.sender,
+            "E61"
+        );
+        // contentHash must be non-zero (inscription exists)
+        require(
+            ICustosProxy(CUSTOS_PROXY).inscriptionContentHash(inscriptionId) != bytes32(0),
+            "E60"
+        );
+    }
+
+    function _validateReveal(
+        uint256 roundId,
+        string calldata answer,
+        bytes32 salt
+    ) internal view {
+        Round storage r = rounds[roundId];
+        require(r.roundId == roundId && r.epochId == currentEpochId, "E58");
+        require(
+            block.timestamp >= r.commitCloseAt &&
+            block.timestamp <  r.revealCloseAt,              "E14");
+        require(!r.settled && !r.expired,                    "E40");
+        require(tierSnapshot[currentEpochId][msg.sender] > 0,"E12");
+
+        Submission storage sub = submissions[roundId][msg.sender];
+        require(sub.committed,  "E57");
+        require(!sub.revealed,  "E15");
+        require(
+            _pendingReveals[roundId].length < MAX_REVEALERS_PER_ROUND,
+            "E18"
+        );
+
+        // ── On-chain verification ────────────────────────────────────
+        // Agent's commit inscription contentHash = keccak256(answer|salt)
+        bytes32 expected = ICustosProxy(CUSTOS_PROXY)
+            .inscriptionContentHash(sub.commitInscriptionId);
+        require(expected != bytes32(0), "E60");
+        require(
+            keccak256(abi.encodePacked(answer, salt)) == expected,
+            "E17"
+        );
+    }
+
+    // ============ Claim ============
+
     function claimEpochReward(uint256 epochId) external nonReentrant {
-        require(epochClaimed[epochId][msg.sender] == false, "Already claimed");
-        
-        Epoch storage epoch = epochs[epochId];
-        require(epoch.settled, "Epoch not settled");
-        require(block.timestamp <= epoch.claimDeadline, "Claim deadline passed");
-        
+        Epoch storage ep = epochs[epochId];
+        require(ep.settled,                         "E20");
+        require(!epochClaimed[epochId][msg.sender], "E21");
+        require(block.timestamp <= ep.claimDeadline,"E22");
         uint256 credits = epochCredits[epochId][msg.sender];
-        require(credits > 0, "No credits");
-        
-        uint256 claimable = (epoch.rewardPool * credits) / epoch.totalCredits;
-        
-        // CEI: set state before transfer
-        epochClaimed[epochId][msg.sender] = true;
-        epochClaimedAmount[epochId] += claimable;
-        
-        IERC20(CUSTOS_TOKEN).safeTransfer(msg.sender, claimable);
-        
-        emit RewardClaimed(epochId, msg.sender, claimable);
+        require(credits > 0,                        "E23");
+        epochClaimed[epochId][msg.sender]  = true;
+        uint256 reward = (ep.rewardPool * credits) / ep.totalCredits;
+        epochClaimedAmount[epochId]       += reward;
+        IERC20(CUSTOS_TOKEN).safeTransfer(msg.sender, reward);
+        emit RewardClaimed(epochId, msg.sender, reward);
     }
 
-    // ============ Oracle Functions ============
+    // ============ Oracle ============
 
-    /**
-     * @notice Post a new round (oracle only)
-     * @param questionUri URI to question data
-     * @param answerHash Hash of correct answer
-     * @return roundId The ID of the newly created round
-     */
-    function postRound(string calldata questionUri, bytes32 answerHash) external onlyOracle returns (uint256 roundId) {
-        require(epochOpen, "No epoch open");
-        require(snapshotComplete, "Snapshot not complete");
+    function postRound(string calldata questionUri, bytes32 answerHash)
+        external onlyOracle returns (uint256 roundId)
+    {
+        require(epochOpen,        "E10");
+        require(snapshotComplete, "E50");
+        require(roundCount < ROUNDS_PER_EPOCH, "E40");
+
         roundId = ++roundCount;
-        
-        uint256 commitOpen = block.timestamp;
-        uint256 commitClose = commitOpen + COMMIT_WINDOW;
-        uint256 revealClose = commitClose + REVEAL_WINDOW;
-        
+        uint256 now_ = block.timestamp;
         rounds[roundId] = Round({
-            roundId: roundId,
-            epochId: currentEpochId,
-            commitOpenAt: commitOpen,
-            commitCloseAt: commitClose,
-            revealCloseAt: revealClose,
-            answerHash: answerHash,
-            questionUri: questionUri,
-            settled: false,
-            expired: false,
+            roundId:       roundId,
+            epochId:       currentEpochId,
+            commitOpenAt:  now_,
+            commitCloseAt: now_ + COMMIT_WINDOW,
+            revealCloseAt: now_ + COMMIT_WINDOW + REVEAL_WINDOW,
+            answerHash:    answerHash,
+            questionUri:   questionUri,
+            settled:       false,
+            expired:       false,
             batchSettling: false,
             revealedAnswer: "",
-            correctCount: 0,
-            revealCount: 0
+            correctCount:  0,
+            revealCount:   0
         });
-        
-        emit RoundPosted(roundId, questionUri, commitOpen, commitClose, revealClose);
+        emit RoundPosted(roundId, questionUri, now_, now_ + COMMIT_WINDOW, now_ + COMMIT_WINDOW + REVEAL_WINDOW);
     }
 
-    /**
-     * @notice Settle a round with correct answer (oracle only)
-     * @param roundId Round to settle
-     * @param correctAnswer The correct answer
-     */
-    function settleRound(uint256 roundId, string calldata correctAnswer) external onlyOracle {
-        require(!rounds[roundId].settled, "Already settled");
-        require(!rounds[roundId].expired, "Already expired");
-        require(!rounds[roundId].batchSettling, "Batch settle in progress");
-        require(keccak256(abi.encodePacked(correctAnswer)) == rounds[roundId].answerHash, "Answer mismatch");
-        
-        Round storage round = rounds[roundId];
+    function settleRound(uint256 roundId, string calldata correctAnswer)
+        external onlyOracle
+    {
+        Round storage r = rounds[roundId];
+        require(!r.settled && !r.expired,  "E40");
+        require(!r.batchSettling,          "E52");
+        require(block.timestamp >= r.revealCloseAt, "E14");
+        require(r.answerHash == keccak256(abi.encodePacked(correctAnswer)), "E17");
+
         address[] storage pending = _pendingReveals[roundId];
-        
-        uint256 correctCount = 0;
-        uint256 totalReveals = pending.length;
-        
-        for (uint256 i = 0; i < pending.length; i++) {
+        uint256 len = pending.length;
+        require(len <= MAX_REVEALERS_PER_ROUND, "E53");
+
+        uint256 epochId = r.epochId;
+        for (uint256 i = 0; i < len; i++) {
             address wallet = pending[i];
             Submission storage sub = submissions[roundId][wallet];
-            
-            if (keccak256(abi.encodePacked(sub.revealedAnswer)) == keccak256(abi.encodePacked(correctAnswer))) {
-                if (!sub.credited) {
-                    sub.credited = true;
-                    correctCount++;
-                    
-                    uint256 credits = _calculateCredits(round.epochId, wallet, sub.tierAtCommit);
-                    epochCredits[round.epochId][wallet] += credits;
-                    
-                    emit RoundSolved(roundId, wallet, credits);
-                }
+            if (!sub.revealed || sub.credited) continue;
+            if (keccak256(abi.encodePacked(sub.revealedAnswer)) ==
+                keccak256(abi.encodePacked(correctAnswer)))
+            {
+                sub.credited = true;
+                uint256 tier = tierSnapshot[epochId][wallet];
+                uint256 credits = tier; // tier1=1, tier2=2, tier3=3
+                epochCredits[epochId][wallet] += credits;
+                r.correctCount++;
+                emit RoundSolved(roundId, wallet, credits);
             }
         }
-        
-        round.settled = true;
-        round.revealedAnswer = correctAnswer;
-        round.correctCount = correctCount;
-        round.revealCount = totalReveals;
-        
+
+        r.revealedAnswer = correctAnswer;
+        r.revealCount    = len;
+        r.settled        = true;
         delete _pendingReveals[roundId];
-        
-        emit RoundSettled(roundId, correctAnswer, correctCount, totalReveals);
+        emit RoundSettled(roundId, correctAnswer, r.correctCount, len);
     }
 
-    /**
-     * @notice Settle a round in batches (oracle only)
-     * @param roundId Round to settle
-     * @param start Start index in pending reveals array
-     * @param end End index (exclusive)
-     * @param correctAnswer The correct answer
-     */
     function settleBatch(
-        uint256 roundId, 
-        uint256 start, 
-        uint256 end, 
+        uint256 roundId,
+        uint256 start,
+        uint256 end,
         string calldata correctAnswer
     ) external onlyOracle {
-        require(!rounds[roundId].settled, "Already settled");
-        require(!rounds[roundId].expired, "Already expired");
-        // Verify correctAnswer matches the committed answerHash — prevents oracle from
-        // using different answers across batches
-        require(keccak256(abi.encodePacked(correctAnswer)) == rounds[roundId].answerHash, "Answer mismatch");
-        // Mark batch settling in progress — blocks settleRound from running in parallel
-        if (!rounds[roundId].batchSettling) {
-            rounds[roundId].batchSettling = true;
-        }
-        
-        Round storage round = rounds[roundId];
+        Round storage r = rounds[roundId];
+        require(!r.settled && !r.expired, "E40");
+        require(block.timestamp >= r.revealCloseAt, "E14");
+        require(r.answerHash == keccak256(abi.encodePacked(correctAnswer)), "E17");
+        require(start < end, "E34");
+
         address[] storage pending = _pendingReveals[roundId];
-        
-        require(start < end, "Empty batch");
-        require(end <= pending.length, "End out of bounds");
-        
-        uint256 correctCount = 0;
-        
+        require(end <= pending.length, "E34");
+
+        if (!r.batchSettling) r.batchSettling = true;
+
+        uint256 epochId = r.epochId;
         for (uint256 i = start; i < end; i++) {
             address wallet = pending[i];
             Submission storage sub = submissions[roundId][wallet];
-            
-            if (keccak256(abi.encodePacked(sub.revealedAnswer)) == keccak256(abi.encodePacked(correctAnswer))) {
-                if (!sub.credited) {
-                    sub.credited = true;
-                    correctCount++;
-                    
-                    uint256 credits = _calculateCredits(round.epochId, wallet, sub.tierAtCommit);
-                    epochCredits[round.epochId][wallet] += credits;
-                    
-                    emit RoundSolved(roundId, wallet, credits);
-                }
+            if (!sub.revealed || sub.credited) continue;
+            if (keccak256(abi.encodePacked(sub.revealedAnswer)) ==
+                keccak256(abi.encodePacked(correctAnswer)))
+            {
+                sub.credited = true;
+                uint256 credits = tierSnapshot[epochId][wallet];
+                epochCredits[epochId][wallet] += credits;
+                r.correctCount++;
+                emit RoundSolved(roundId, wallet, credits);
             }
         }
-        
-        round.correctCount += correctCount;
-        round.revealCount += (end - start);
-        
-        // If this is the last batch, settle the round
+
         if (end == pending.length) {
-            round.settled = true;
-            round.revealedAnswer = correctAnswer;
+            r.revealedAnswer = correctAnswer;
+            r.revealCount    = pending.length;
+            r.settled        = true;
+            r.batchSettling  = false;
             delete _pendingReveals[roundId];
-            
-            emit RoundSettled(roundId, correctAnswer, round.correctCount, round.revealCount);
+            emit RoundSettled(roundId, correctAnswer, r.correctCount, r.revealCount);
         }
     }
 
-    /**
-     * @notice Expire a round (permissionless)
-     * @param roundId Round to expire
-     */
     function expireRound(uint256 roundId) external {
-        Round storage round = rounds[roundId];
-        require(!round.settled, "Already settled");
-        require(!round.expired, "Already expired");
-        require(block.timestamp > round.revealCloseAt, "Reveal still open");
-        
-        round.expired = true;
+        Round storage r = rounds[roundId];
+        require(!r.settled && !r.expired,          "E40");
+        require(block.timestamp > r.revealCloseAt + 300, "E51");
+        r.expired = true;
         delete _pendingReveals[roundId];
-        
         emit RoundExpired(roundId);
     }
 
-    /**
-     * @notice Open a new epoch (oracle only)
-     * @param startAt Timestamp when epoch starts
-     */
-    /**
-     * @notice Open a new epoch (oracle only).
-     *         After calling this, call snapshotBatch() until snapshotComplete == true
-     *         before posting any rounds. Rounds revert if snapshot not complete.
-     */
+
+
+    // ============ Epoch Lifecycle ============
+
     function openEpoch(uint256 startAt) external onlyOracle {
-        require(!epochOpen, "Epoch already open");
-        
-        // Drain pending rewards to epoch reward pool
-        uint256 rewardPool = pendingRewards;
-        pendingRewards = 0;
-        
+        require(!epochOpen, "E11");
+        // Move staged rewards into this epoch's pool
+        uint256 rewardPool = rewardBuffer;
+        rewardBuffer = 0;
         uint256 epochId = ++currentEpochId;
-        
         epochs[epochId] = Epoch({
-            epochId: epochId,
-            startAt: startAt,
-            endAt: startAt + EPOCH_DURATION,
-            rewardPool: rewardPool,
+            epochId:      epochId,
+            startAt:      startAt,
+            endAt:        startAt + EPOCH_DURATION,
+            rewardPool:   rewardPool,
             totalCredits: 0,
-            settled: false,
+            settled:      false,
             claimDeadline: startAt + EPOCH_DURATION + CLAIM_WINDOW
         });
-        
-        epochOpen = true;
-        snapshotCursor = 0;
-        snapshotComplete = stakedAgents.length == 0; // complete immediately if no stakers
-        
+        epochOpen        = true;
+        snapshotCursor   = 0;
+        snapshotComplete = stakedAgents.length == 0;
+        roundCount       = 0;
         emit EpochOpened(epochId, startAt, startAt + EPOCH_DURATION, rewardPool);
     }
 
-    /**
-     * @notice Snapshot tier positions for up to `batchSize` staked agents (oracle only).
-     *         Call repeatedly until snapshotComplete == true before posting rounds.
-     * @param batchSize Max agents to snapshot in this call
-     */
     function snapshotBatch(uint256 batchSize) external onlyOracle {
-        require(epochOpen, "No epoch open");
-        require(!snapshotComplete, "Snapshot already complete");
-        require(batchSize > 0, "Zero batch size");
-        
+        require(epochOpen,          "E10");
+        require(!snapshotComplete,  "E33");
+        require(batchSize > 0,      "E34");
         uint256 epochId = currentEpochId;
         uint256 t1 = tier1Threshold;
         uint256 t2 = tier2Threshold;
         uint256 t3 = tier3Threshold;
-        
         uint256 cursor = snapshotCursor;
-        uint256 total = stakedAgents.length;
-        uint256 end = cursor + batchSize;
+        uint256 total  = stakedAgents.length;
+        uint256 end    = cursor + batchSize;
         if (end > total) end = total;
-        
         for (uint256 i = cursor; i < end; i++) {
             address wallet = stakedAgents[i];
-            StakePosition storage stakePos = stakes[wallet];
-            // Skip if withdrawal queued (exiting after this epoch)
-            if (stakePos.withdrawalQueued) continue;
-            uint256 tier = _computeTier(stakePos.amount, t1, t2, t3);
-            tierSnapshot[epochId][wallet] = tier;
+            if (stakes[wallet].withdrawalQueued) continue;
+            tierSnapshot[epochId][wallet] = _computeTier(stakes[wallet].amount, t1, t2, t3);
         }
-        
         snapshotCursor = end;
-        if (end == total) {
-            snapshotComplete = true;
-        }
+        if (end == total) snapshotComplete = true;
     }
 
-    /**
-     * @notice Close current epoch (oracle only)
-     */
-    /**
-     * @notice Begin closing the current epoch (oracle only).
-     *         After calling this, call accumulateCreditsBatch() until creditCursor
-     *         reaches stakedAgents.length, then call finalizeClose().
-     *         If there are no stakers, call finalizeClose() directly.
-     */
     function closeEpoch() external onlyOracle {
-        require(epochOpen, "No epoch open");
+        require(epochOpen, "E10");
         creditCursor = 0;
     }
 
-    /**
-     * @notice Accumulate epoch credits for up to `batchSize` agents (oracle only).
-     * @param batchSize Max agents to process in this call
-     */
     function accumulateCreditsBatch(uint256 batchSize) external onlyOracle {
-        require(epochOpen, "No epoch open");
-        require(batchSize > 0, "Zero batch size");
-        
+        require(epochOpen,     "E10");
+        require(batchSize > 0, "E34");
         uint256 epochId = currentEpochId;
-        uint256 cursor = creditCursor;
-        uint256 total = stakedAgents.length;
-        uint256 end = cursor + batchSize;
+        uint256 cursor  = creditCursor;
+        uint256 total   = stakedAgents.length;
+        uint256 end     = cursor + batchSize;
         if (end > total) end = total;
-        
-        Epoch storage epoch = epochs[epochId];
+        Epoch storage ep = epochs[epochId];
         for (uint256 i = cursor; i < end; i++) {
-            epoch.totalCredits += epochCredits[epochId][stakedAgents[i]];
+            ep.totalCredits += epochCredits[epochId][stakedAgents[i]];
         }
-        
         creditCursor = end;
     }
 
-    /**
-     * @notice Finalize epoch close after credit accumulation is complete (oracle only).
-     *         Also auto-removes agents who queued withdrawal during this epoch.
-     */
     function finalizeClose() external onlyOracle {
-        require(epochOpen, "No epoch open");
-        require(creditCursor >= stakedAgents.length, "Credits not fully accumulated");
-        
-        Epoch storage epoch = epochs[currentEpochId];
-        epoch.settled = true;
-        
-        // Apply pending tier changes
+        require(epochOpen,                         "E10");
+        require(creditCursor >= stakedAgents.length, "E35");
+        Epoch storage ep = epochs[currentEpochId];
+        ep.settled = true;
         if (tierChangePending) {
-            tier1Threshold = pendingTier1;
-            tier2Threshold = pendingTier2;
-            tier3Threshold = pendingTier3;
+            tier1Threshold  = pendingTier1;
+            tier2Threshold  = pendingTier2;
+            tier3Threshold  = pendingTier3;
             tierChangePending = false;
             emit TierThresholdsUpdated(tier1Threshold, tier2Threshold, tier3Threshold);
         }
-        
-        // Auto-remove agents with queued withdrawals from stakedAgents[]
-        // Marks stakedIndex = type(uint256).max as sentinel so withdrawStake skips re-removal
-        // They can still call withdrawStake() to collect their tokens
         uint256 i = 0;
         while (i < stakedAgents.length) {
             address wallet = stakedAgents[i];
             if (stakes[wallet].withdrawalQueued) {
                 _removeFromStakedAgents(wallet);
-                stakes[wallet].stakedIndex = type(uint256).max; // sentinel: already removed
-                // do not increment i — the swapped-in agent at index i needs checking
+                stakes[wallet].stakedIndex = type(uint256).max;
             } else {
                 i++;
             }
         }
-        
-        epochOpen = false;
+        epochOpen        = false;
         snapshotComplete = false;
-        creditCursor = 0;
-        snapshotCursor = 0;
-        
-        emit EpochClosed(currentEpochId, epoch.totalCredits, epoch.rewardPool);
+        creditCursor     = 0;
+        snapshotCursor   = 0;
+        emit EpochClosed(currentEpochId, ep.totalCredits, ep.rewardPool);
     }
 
-    // ============ Admin Functions ============
-
-    /**
-     * @notice Fund epoch with $CUSTOS (custodian only)
-     * @param custosAmount Amount to fund
-     */
-    function fundEpoch(uint256 custosAmount) external onlyCustodian {
-        require(custosAmount > 0, "Amount must be > 0");
-        
-        IERC20(CUSTOS_TOKEN).safeTransferFrom(msg.sender, address(this), custosAmount);
-        pendingRewards += custosAmount;
-        
-        emit CustosReceived(custosAmount, pendingRewards);
-    }
-
-    /**
-     * @notice Seed rewards from already transferred tokens (custodian only)
-     * @param amount Amount to register as pending
-     */
-    function seedRewards(uint256 amount) external onlyCustodian {
-        require(amount > 0, "Amount must be > 0");
-        
-        uint256 balance = IERC20(CUSTOS_TOKEN).balanceOf(address(this));
-        // Account for all locked amounts: staked tokens + pending rewards + active epoch pool
-        uint256 available = balance;
-        for (uint256 i = 0; i < stakedAgents.length; i++) {
-            available -= stakes[stakedAgents[i]].amount;
-        }
-        available -= pendingRewards;
-        if (epochOpen) {
-            available -= epochs[currentEpochId].rewardPool;
-        }
-        
-        require(available >= amount, "Insufficient balance");
-        
-        pendingRewards += amount;
-        
-        emit CustosReceived(amount, pendingRewards);
-    }
-
-    /**
-     * @notice Receive $CUSTOS from CustosMineRewards
-     * @param amount Amount received
-     */
-    function receiveCustos(uint256 amount) external {
-        require(custosMineRewards != address(0), "Rewards not set");
-        require(msg.sender == custosMineRewards, "Only rewards contract");
-        
-        pendingRewards += amount;
-        
-        emit CustosReceived(amount, pendingRewards);
-    }
-
-    /**
-     * @notice Sweep unclaimed rewards after claim deadline (oracle only)
-     * @param epochId Epoch to sweep
-     */
+    /// @notice After the 30-day claim window, unclaimed $CUSTOS rolls into the next epoch's reward pool.
+    /// @dev Tokens stay in this contract — they move from expired epoch accounting into rewardBuffer.
     function sweepExpiredClaims(uint256 epochId) external onlyOracle {
-        require(epochs[epochId].settled, "Epoch not settled");
-        require(block.timestamp > epochs[epochId].claimDeadline, "Claim deadline not passed");
-        
+        require(epochs[epochId].settled,                   "E20");
+        require(block.timestamp > epochs[epochId].claimDeadline, "E43");
         uint256 unclaimed = epochs[epochId].rewardPool - epochClaimedAmount[epochId];
-        require(unclaimed > 0, "No unclaimed rewards");
-        
-        epochClaimedAmount[epochId] = epochs[epochId].rewardPool; // Mark fully claimed
-        pendingRewards += unclaimed;
-        
+        require(unclaimed > 0, "E49");
+        epochClaimedAmount[epochId] = epochs[epochId].rewardPool;
+        rewardBuffer += unclaimed;
         emit ExpiredClaimsSwept(epochId, unclaimed);
     }
 
-    /**
-     * @notice Recover accidentally sent ERC20 tokens (custodian only)
-     * @param token Token to recover
-     * @param amount Amount to recover
-     * @param to Recipient address
-     */
+    // ============ Admin ============
+
+    function receiveCustos(uint256 amount) external {
+        require(custosMineRewards != address(0), "E29");
+        require(msg.sender == custosMineRewards, "E44");
+        rewardBuffer += amount;
+        emit CustosReceived(amount, rewardBuffer);
+    }
+
+    /// @notice Pull $CUSTOS from caller into the reward buffer for the next epoch.
+    function depositRewards(uint256 amount) external onlyCustodian {
+        require(amount > 0, "E30");
+        IERC20(CUSTOS_TOKEN).safeTransferFrom(msg.sender, address(this), amount);
+        rewardBuffer += amount;
+        emit CustosReceived(amount, rewardBuffer);
+    }
+
+    /// @notice Mark already-held $CUSTOS (e.g. received via receiveCustos) as staged for the next epoch.
+    /// @dev Only allocates from free balance — cannot touch staked tokens or the current epoch's pool.
+    function allocateRewards(uint256 amount) external onlyCustodian {
+        require(amount > 0, "E30");
+        uint256 bal = IERC20(CUSTOS_TOKEN).balanceOf(address(this));
+        uint256 locked = rewardBuffer;
+        if (epochOpen) locked += epochs[currentEpochId].rewardPool;
+        for (uint256 i = 0; i < stakedAgents.length; i++) locked += stakes[stakedAgents[i]].amount;
+        require(bal >= locked + amount, "E48");
+        rewardBuffer += amount;
+        emit CustosReceived(amount, rewardBuffer);
+    }
+
     function recoverERC20(address token, uint256 amount, address to) external onlyCustodian {
-        require(to != address(0), "zero recipient");
-        // If recovering CUSTOS, protect staked amounts + reward pool
-        uint256 protectedAmount = 0;
+        require(to != address(0), "E29");
+        uint256 protected = 0;
         if (token == CUSTOS_TOKEN) {
-            protectedAmount = pendingRewards;
-            if (epochOpen) {
-                protectedAmount += epochs[currentEpochId].rewardPool;
-            }
-            for (uint256 i = 0; i < stakedAgents.length; i++) {
-                protectedAmount += stakes[stakedAgents[i]].amount;
-            }
+            protected = rewardBuffer;
+            if (epochOpen) protected += epochs[currentEpochId].rewardPool;
+            for (uint256 i = 0; i < stakedAgents.length; i++) protected += stakes[stakedAgents[i]].amount;
         }
-        
-        uint256 tokenBalance = IERC20(token).balanceOf(address(this));
-        require(tokenBalance >= protectedAmount + amount, "Insufficient available");
-        
+        require(IERC20(token).balanceOf(address(this)) >= protected + amount, "E48");
         IERC20(token).safeTransfer(to, amount);
     }
 
-    /**
-     * @notice Recover accidentally sent ETH (custodian only)
-     * @param to Recipient address
-     */
     function recoverETH(address payable to) external onlyCustodian {
-        require(to != address(0), "zero recipient");
+        require(to != address(0), "E29");
         uint256 bal = address(this).balance;
-        require(bal > 0, "No ETH");
-        (bool success,) = to.call{value: bal}("");
-        require(success, "ETH transfer failed");
+        require(bal > 0, "E46");
+        (bool ok,) = to.call{value: bal}("");
+        require(ok, "E47");
     }
 
-    /**
-     * @notice Set oracle address (custodian only)
-     * @param newOracle New oracle address
-     */
     function setOracle(address newOracle) external onlyCustodian {
-        require(newOracle != address(0), "zero oracle");
+        require(newOracle != address(0), "E29");
         address prev = oracle;
         oracle = newOracle;
         emit OracleUpdated(prev, newOracle);
     }
 
-    /**
-     * @notice Set CustosMineRewards address (owner only)
-     * @param newRewards New rewards contract address
-     */
     function setCustosMineRewards(address newRewards) external onlyOwner {
-        require(newRewards != address(0), "zero address");
+        require(newRewards != address(0), "E29");
         address prev = custosMineRewards;
         custosMineRewards = newRewards;
         emit MineRewardsUpdated(prev, newRewards);
     }
 
-    /**
-     * @notice Set tier thresholds (custodian only)
-     * @param t1 Tier 1 threshold
-     * @param t2 Tier 2 threshold
-     * @param t3 Tier 3 threshold
-     */
     function setTierThresholds(uint256 t1, uint256 t2, uint256 t3) external onlyCustodian {
-        require(t1 < t2 && t2 < t3, "Invalid tier order");
-        
-        pendingTier1 = t1;
-        pendingTier2 = t2;
-        pendingTier3 = t3;
+        require(t1 < t2 && t2 < t3, "E31");
+        pendingTier1 = t1; pendingTier2 = t2; pendingTier3 = t3;
         tierChangePending = true;
-        
         emit PendingTierThresholdsSet(t1, t2, t3);
     }
 
-    /**
-     * @notice Set custodian status (owner only)
-     * @param account Account to modify
-     * @param enabled True to enable, false to disable
-     */
     function setCustodian(address account, bool enabled) external onlyOwner {
-        require(account != address(0), "zero address");
+        require(account != address(0), "E29");
         custodians[account] = enabled;
         emit CustodianSet(account, enabled);
     }
 
-    /**
-     * @notice Transfer ownership (owner only)
-     * @param newOwner New owner address
-     */
     function transferOwnership(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "zero owner");
+        require(newOwner != address(0), "E29");
         address prev = owner;
         owner = newOwner;
         emit OwnershipTransferred(prev, newOwner);
     }
 
-    /**
-     * @notice Pause the contract (custodian only)
-     */
-    function pause() external onlyCustodian {
-        paused = true;
-        
-        emit Paused();
-    }
+    function pause()   external onlyCustodian { paused = true;  emit Paused(); }
+    function unpause() external onlyCustodian { paused = false; emit Unpaused(); }
 
-    /**
-     * @notice Unpause the contract (custodian only)
-     */
-    function unpause() external onlyCustodian {
-        paused = false;
-        
-        emit Unpaused();
-    }
+    // ============ View ============
 
-    /**
-     * @notice Set epoch duration (owner only)
-     * @param duration New duration
-     */
-
-
-    // ============ View Functions ============
-
-    /**
-     * @notice Get current round
-     * @return Round Current round or empty if no rounds
-     */
     function getCurrentRound() external view returns (Round memory) {
-        if (roundCount == 0) { return Round(0, 0, 0, 0, 0, bytes32(0), "", false, false, false, "", 0, 0); }
+        if (roundCount == 0) return Round(0,0,0,0,0,bytes32(0),"",false,false,false,"",0,0);
         return rounds[roundCount];
     }
+    function getRound(uint256 roundId)   external view returns (Round memory)  { return rounds[roundId]; }
+    function getEpoch(uint256 epochId)   external view returns (Epoch memory)  { return epochs[epochId]; }
+    function getStake(address wallet)    external view returns (StakePosition memory) { return stakes[wallet]; }
+    function getTierSnapshot(address w, uint256 e) external view returns (uint256) { return tierSnapshot[e][w]; }
+    function getCredits(address w, uint256 e)      external view returns (uint256) { return epochCredits[e][w]; }
+    function getStakedAgentCount()       external view returns (uint256) { return stakedAgents.length; }
+    function getPendingRevealCount(uint256 roundId) external view returns (uint256) { return _pendingReveals[roundId].length; }
 
-    /**
-     * @notice Get round by ID
-     * @param roundId Round ID
-     * @return Round data
-     */
-    function getRound(uint256 roundId) external view returns (Round memory) {
-        return rounds[roundId];
-    }
-
-    /**
-     * @notice Get epoch data
-     * @param epochId Epoch ID
-     * @return Epoch data
-     */
-    function getEpoch(uint256 epochId) external view returns (Epoch memory) {
-        return epochs[epochId];
-    }
-
-    /**
-     * @notice Get stake position for a wallet
-     * @param wallet Wallet address
-     * @return StakePosition stake data
-     */
-    function getStake(address wallet) external view returns (StakePosition memory) {
-        return stakes[wallet];
-    }
-
-    /**
-     * @notice Get tier snapshot for a wallet in an epoch
-     * @param wallet Wallet address
-     * @param epochId Epoch ID
-     * @return tier Tier snapshot (0 if not staked that epoch)
-     */
-    function getTierSnapshot(address wallet, uint256 epochId) external view returns (uint256 tier) {
-        return tierSnapshot[epochId][wallet];
-    }
-
-    /**
-     * @notice Get credits for a wallet in an epoch
-     * @param wallet Wallet address
-     * @param epochId Epoch ID
-     * @return credits Credit amount
-     */
-    function getCredits(address wallet, uint256 epochId) external view returns (uint256 credits) {
-        return epochCredits[epochId][wallet];
-    }
-
-    /**
-     * @notice Calculate claimable amount for a wallet
-     * @param wallet Wallet address
-     * @param epochId Epoch ID
-     * @return claimable Amount claimable
-     */
-    function getClaimable(address wallet, uint256 epochId) external view returns (uint256 claimable) {
+    function getClaimable(address wallet, uint256 epochId) external view returns (uint256) {
         if (epochClaimed[epochId][wallet]) return 0;
-        
-        Epoch storage epoch = epochs[epochId];
-        if (!epoch.settled) return 0;
-        if (block.timestamp > epoch.claimDeadline) return 0;
-        
+        Epoch storage ep = epochs[epochId];
+        if (!ep.settled || block.timestamp > ep.claimDeadline) return 0;
         uint256 credits = epochCredits[epochId][wallet];
-        if (credits == 0) return 0;
-        
-        return (epoch.rewardPool * credits) / epoch.totalCredits;
+        if (credits == 0 || ep.totalCredits == 0) return 0;
+        return (ep.rewardPool * credits) / ep.totalCredits;
     }
 
-    /**
-     * @notice Check if commit window is open
-     * @return bool True if commit is open
-     */
-    function isCommitOpen() external view returns (bool) {
-        if (roundCount == 0 || !epochOpen) return false;
-        Round storage round = rounds[roundCount];
-        return round.commitOpenAt <= block.timestamp && round.commitCloseAt > block.timestamp;
+    function getSubmission(uint256 roundId, address wallet) external view returns (Submission memory) {
+        return submissions[roundId][wallet];
     }
 
-    /**
-     * @notice Check if reveal window is open
-     * @return bool True if reveal is open
-     */
-    function isRevealOpen() external view returns (bool) {
-        if (roundCount == 0 || !epochOpen) return false;
-        Round storage round = rounds[roundCount];
-        return round.commitCloseAt <= block.timestamp && round.revealCloseAt > block.timestamp;
-    }
+    // ============ Internal ============
 
-    /**
-     * @notice Get count of pending reveals for a round
-     * @param roundId Round ID
-     * @return count Number of pending reveals
-     */
-    function getPendingRevealCount(uint256 roundId) external view returns (uint256 count) {
-        return _pendingReveals[roundId].length;
-    }
-
-    /**
-     * @notice Get list of pending revealers for a round
-     * @param roundId Round ID
-     * @param offset Start index
-     * @param limit Number of addresses to return
-     * @return List of wallet addresses
-     */
-    function getPendingRevealers(uint256 roundId, uint256 offset, uint256 limit) 
-        external 
-        view 
-        returns (address[] memory) 
-    {
-        address[] storage pending = _pendingReveals[roundId];
-        if (offset >= pending.length) return new address[](0);
-        
-        uint256 available = pending.length - offset;
-        uint256 toReturn = available < limit ? available : limit;
-        
-        address[] memory result = new address[](toReturn);
-        for (uint256 i = 0; i < toReturn; i++) {
-            result[i] = pending[offset + i];
-        }
-        return result;
-    }
-
-    /**
-     * @notice Get number of staked agents
-     * @return count Number of staked agents
-     */
-    function getStakedAgentCount() external view returns (uint256 count) {
-        return stakedAgents.length;
-    }
-
-    // ============ Internal Functions ============
-
-    /**
-     * @notice Compute tier from stake amount
-     * @param amount Stake amount
-     * @return tier Tier (1, 2, or 3)
-     */
-    function _computeTier(uint256 amount, uint256 t1, uint256 t2, uint256 t3) 
-        internal 
-        pure 
-        returns (uint256 tier) 
+    function _computeTier(uint256 amount, uint256 t1, uint256 t2, uint256 t3)
+        internal pure returns (uint256)
     {
         if (amount >= t3) return 3;
         if (amount >= t2) return 2;
@@ -1033,34 +776,11 @@ contract CustosMineController {
         return 0;
     }
 
-    /**
-     * @notice Get tier from balance using current thresholds
-     * @param amount Stake amount
-     * @return tier Current tier
-     */
-    function _getTierFromBalance(uint256 amount) internal view returns (uint256 tier) {
+    function _getTier(uint256 amount) internal view returns (uint256) {
         return _computeTier(amount, tier1Threshold, tier2Threshold, tier3Threshold);
     }
 
-    /**
-     * @notice Calculate credits for a correct reveal
-     * @param tier Tier at commit time (1/2/3)
-     * @return credits Credits earned (equals tier value)
-     */
-    function _calculateCredits(uint256 /*epochId*/, address /*wallet*/, uint256 tier) 
-        internal 
-        pure 
-        returns (uint256 credits) 
-    {
-        // Credits = tier value: tier1=1, tier2=2, tier3=3
-        // Proportional reward share: (myCredits / totalCredits) * rewardPool
-        return tier;
-    }
-
-    // _calculateTotalCredits removed — replaced by accumulateCreditsBatch + finalizeClose
-
-    // ============ Fallback ============
     receive() external payable {
-        require(msg.sender == custosMineRewards, "Only rewards contract can send ETH");
+        require(msg.sender == custosMineRewards, "E44");
     }
 }

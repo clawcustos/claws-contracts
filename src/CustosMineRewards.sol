@@ -10,15 +10,10 @@ interface ICustosMineController {
 
 /**
  * @title CustosMineRewards
- * @notice Accumulates WETH from 0xSplits R&D allocation.
- *         On epoch open: swaps WETH → $CUSTOS via 0x allowance-holder,
- *         forwards $CUSTOS to CustosMineController as epoch reward pool.
+ * @notice Accumulates WETH, swaps to $CUSTOS, and forwards to CustosMineController as epoch rewards.
+ *         Swap is executed via 0x allowance-holder router (standard ERC20 approve — not permit2).
  *
- * Access: oracle (Custos) or custodian (Pizza) only.
- * No timelock on recoverFunds — trusted parties only.
- *
- * Flow:
- *   0xSplits → this contract (WETH) → swapAndSend() → CustosMineController
+ * Access: oracle or custodian only.
  */
 contract CustosMineRewards {
     using SafeERC20 for IERC20;
@@ -96,13 +91,10 @@ contract CustosMineRewards {
     // ─── Core ─────────────────────────────────────────────────────────────────
 
     /**
-     * @notice Swap all held WETH → $CUSTOS, send to CustosMineController.
-     * @dev Called by oracle at each epoch open.
-     *      swapCalldata: pre-computed 0x API calldata targeting ALLOWANCE_HOLDER.
-     *      Uses 0x allowance-holder pattern (standard ERC20 approve — NOT permit2).
-     *      minAmountOut: slippage guard. Reverts if $CUSTOS received < minAmountOut.
-     * @param swapCalldata  0x API calldata
-     * @param minAmountOut  Minimum $CUSTOS to receive (set to market rate * 0.98 off-chain)
+     * @notice Swap all held WETH → $CUSTOS and forward to CustosMineController.
+     * @dev Uses 0x allowance-holder pattern (standard ERC20 approve — NOT permit2).
+     * @param swapCalldata  Pre-computed 0x API calldata targeting ALLOWANCE_HOLDER.
+     * @param minAmountOut  Slippage guard — reverts if $CUSTOS received is below this.
      */
     function swapAndSend(
         bytes calldata swapCalldata,
@@ -133,11 +125,7 @@ contract CustosMineRewards {
         emit SwappedAndSent(wethIn, custosReceived, controller);
     }
 
-    /**
-     * @notice Receive WETH from 0xSplits or manual transfer.
-     * @dev 0xSplits sends via transferFrom — caller must approve first.
-     *      Or send WETH directly (contract holds it passively).
-     */
+    /// @notice Pull WETH from caller into this contract. Caller must approve first.
     function receiveWeth(uint256 amount) external {
         IERC20(WETH).safeTransferFrom(msg.sender, address(this), amount);
     }
