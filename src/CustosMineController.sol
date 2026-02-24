@@ -36,7 +36,8 @@ contract CustosMineController {
 
     // ─── State ────────────────────────────────────────────────────────────────
 
-    address public custodian;
+    address public owner;
+    mapping(address => bool) public custodians;
     address public oracle;
     address public custosMineRewards;     // only contract that can call receiveCustos
     address public immutable CUSTOS_TOKEN;
@@ -135,6 +136,8 @@ contract CustosMineController {
     event OracleUpdated(address indexed prev, address indexed next);
     event TierThresholdsUpdated(uint256 t1, uint256 t2, uint256 t3);
     event ExpiredClaimsSwept(uint256 indexed epochId, uint256 amount);
+    event OwnershipTransferred(address indexed prev, address indexed next);
+    event CustodianSet(address indexed account, bool enabled);
 
     // ─── Modifiers ────────────────────────────────────────────────────────────
 
@@ -143,13 +146,18 @@ contract CustosMineController {
         _;
     }
 
+    modifier onlyOwner() {
+        require(msg.sender == owner, "not owner");
+        _;
+    }
+
     modifier onlyCustodian() {
-        require(msg.sender == custodian, "not custodian");
+        require(custodians[msg.sender], "not custodian");
         _;
     }
 
     modifier onlyAuthorised() {
-        require(msg.sender == oracle || msg.sender == custodian, "not authorised");
+        require(msg.sender == oracle || custodians[msg.sender], "not authorised");
         _;
     }
 
@@ -161,20 +169,27 @@ contract CustosMineController {
     // ─── Constructor ──────────────────────────────────────────────────────────
 
     constructor(
+        address _owner,
+        address[] memory _custodians,
         address _oracle,
-        address _custodian,
         address _custosMineRewards,
         address _custosToken,
         uint256 _tier1,
         uint256 _tier2,
         uint256 _tier3
     ) {
+        require(_owner != address(0), "zero owner");
         require(_oracle != address(0), "zero oracle");
-        require(_custodian != address(0), "zero custodian");
         require(_custosToken != address(0), "zero token");
+        require(_custodians.length > 0, "no custodians");
 
+        owner = _owner;
+        for (uint256 i = 0; i < _custodians.length; i++) {
+            require(_custodians[i] != address(0), "zero custodian");
+            custodians[_custodians[i]] = true;
+            emit CustodianSet(_custodians[i], true);
+        }
         oracle = _oracle;
-        custodian = _custodian;
         custosMineRewards = _custosMineRewards;
         CUSTOS_TOKEN = _custosToken;
         tier1Threshold = _tier1;
@@ -559,6 +574,20 @@ contract CustosMineController {
         require(to != address(0), "zero recipient");
         (bool ok,) = to.call{value: address(this).balance}("");
         require(ok, "ETH transfer failed");
+    }
+
+    // ─── CONFIG (owner only) ─────────────────────────────────────────────────
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "zero owner");
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+
+    function setCustodian(address account, bool enabled) external onlyOwner {
+        require(account != address(0), "zero address");
+        custodians[account] = enabled;
+        emit CustodianSet(account, enabled);
     }
 
     // ─── CONFIG (custodian only) ──────────────────────────────────────────────

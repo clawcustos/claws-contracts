@@ -51,6 +51,7 @@ contract MineTestBase is Test {
     MockWETH             weth;
     MockZeroEx           zeroEx;
 
+    address owner     = makeAddr("owner");
     address oracle    = makeAddr("oracle");
     address custodian = makeAddr("custodian");
     address miner1    = makeAddr("miner1");
@@ -66,9 +67,12 @@ contract MineTestBase is Test {
         weth   = new MockWETH();
         zeroEx = new MockZeroEx(custos);
 
+        address[] memory custodians = new address[](1);
+        custodians[0] = custodian;
         controller = new CustosMineController(
+            owner,
+            custodians,
             oracle,
-            custodian,
             address(0), // custosMineRewards — set after rewards deployment
             address(custos),
             T1, T2, T3
