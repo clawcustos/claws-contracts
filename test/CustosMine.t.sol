@@ -719,7 +719,7 @@ contract CustosMineRewardsTest is MineTestBase {
 
     function test_swapAndSend_revertsNoWETH() public {
         vm.prank(oracle);
-        vm.expectRevert("no WETH to swap");
+        vm.expectRevert(bytes("E46"));
         rewards.swapAndSend(bytes(""), 0);
     }
 
@@ -732,7 +732,7 @@ contract CustosMineRewardsTest is MineTestBase {
 
     function test_recoverFunds_revertsNonCustodian() public {
         vm.prank(oracle);
-        vm.expectRevert("not custodian");
+        vm.expectRevert(bytes("E25"));
         rewards.recoverFunds(address(weth), 1, custodian);
     }
 }

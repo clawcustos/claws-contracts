@@ -653,7 +653,7 @@ contract CustosMineController {
 
     // ============ Admin ============
 
-    function receiveCustos(uint256 amount) external {
+    function receiveCustos(uint256 amount) external nonReentrant {
         require(custosMineRewards != address(0), "E29");
         require(msg.sender == custosMineRewards, "E44");
         rewardBuffer += amount;
