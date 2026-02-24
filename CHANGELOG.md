@@ -138,3 +138,31 @@
 | ALLOWANCE_HOLDER | `0x0000000000001fF3684f28c67538d4D072C22734` |
 | MIN_INSCRIPTION_GAP | 300s (5 min) |
 | INSCRIPTION_FEE | 0.1 USDC |
+
+---
+
+## v0.5.6 — 2026-02-24
+**Implementation:** TBD (pending deployment)
+**Proxy:** `0x9B5FD0B02355E954F159F33D7886e4198ee777b9` (unchanged)
+**Source:** `src/CustosNetworkProxyV056.sol`
+**Status:** Awaiting deployment + Pizza `confirmUpgrade()`
+
+### Changes vs V5.5
+- **Epoch-scoped attestation enforcement** — `attest()` now rejects proofs not from the current epoch
+- New storage slot 37: `mapping(bytes32 => uint256) proofHashEpoch` — set at inscription time as `currentEpoch + 1` (offset prevents epoch 0 ambiguity with "never set")
+- `attest()` checks: `proofHashEpoch[proofHash] == currentEpoch + 1` — rejects stale proofs automatically
+- `attest-external-agents.sh` simplified: just attest `chainHead`, contract handles all rejection logic
+- Versioning: switches to `v0.x.x` convention (pre-audit, unaudited code)
+
+### Storage (appended to V5.5 slots)
+| Slot | Field | Type | Notes |
+|---|---|---|---|
+| 37 | proofHashEpoch | mapping(bytes32 => uint256) | Stored as currentEpoch+1; 0 = never inscribed |
+
+### Tests
+- 10/10 passing (`test/CustosNetworkProxyV056.t.sol`)
+- Covers: epoch enforcement, stale proof rejection, epoch 0 sentinel handling, multi-validator same proof, dedup, regression on V5.5 skill marketplace
+
+### Notes
+- V5.5 was never confirmed on-chain (Pizza never ran confirmUpgrade) — v0.5.6 supersedes it
+- V5.5 commit `da30f66` preserved in history; v0.5.6 builds cleanly on top
