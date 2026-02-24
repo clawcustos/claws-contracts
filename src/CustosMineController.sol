@@ -3,21 +3,21 @@ pragma solidity ^0.8.25;
 
 /**
  * @title CustosMineController v2
- * @notice Proof-of-intelligence mining via CustosNetwork inscriptions.
+ * @notice Proof-of-Agent-Work (PoAW) mining via CustosNetwork inscriptions.
  *
  * Agents participate by inscribing on CustosNetworkProxy each loop:
- *   blockType:   "mine-commit"  (loop N)   contentHash = keccak256(answer|salt)
- *   blockType:   "mine-reveal"  (loop N+1) contentHash = keccak256(answer|salt|commitInscriptionId)
+ *   blockType:   "mine-commit"  (loop N)   contentHash = keccak256(abi.encodePacked(answer, salt))
+ *   blockType:   "mine-reveal"  (loop N+1) no special contentHash required — answer+salt verified against commit
  *
  * Each 10-min loop an agent calls ONE of:
- *   registerCommit(roundId, inscriptionId)                              — round 1 only
- *   registerCommitReveal(roundIdN, insIdN, roundIdN1, answer, salt)    — rounds 2-139
- *   registerReveal(roundId, answer, salt)                              — round 140 only
+ *   registerCommit(roundId, inscriptionId)                              — first round of epoch (no prior reveal)
+ *   registerCommitReveal(roundIdN, insIdN, roundIdN-1, answer, salt)   — rounds 2-139 (commit + reveal previous)
+ *   registerReveal(roundId, answer, salt)                              — final round of epoch (reveal only)
  *
- * On-chain verification in registerCommitReveal / registerReveal:
+ * On-chain verification at reveal:
  *   keccak256(abi.encodePacked(answer, salt)) == proxy.inscriptionContentHash(commitInscriptionId)
  *
- * Oracle role: postRound() + settleRound() only. No commit/reveal handling.
+ * Oracle role: postRound() + settleRound()/settleBatch() only. No commit/reveal handling.
  *
  * Error codes (E01-E62):
  *   E10 No epoch    E11 Already open   E12 Not staked    E13 Below tier1
@@ -33,6 +33,7 @@ pragma solidity ^0.8.25;
  *   E50 Snap not done E51 Not expired  E52 Batch settling E53 Empty batch
  *   E54 Cross epoch  E55 Snap cursor   E56 Bad epoch dur  E57 No commit
  *   E58 Wrong round  E59 Zero insId   E60 Not mine insId E61 Insid agent  E62 commit window
+ *   E63 Swap failed  E64 Closing
  */
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -70,6 +71,7 @@ contract CustosMineController {
 
     bool    public paused;
     bool    public epochOpen;
+    bool    public epochClosing; // set by closeEpoch(), blocks postRound until next openEpoch
     uint256 public currentEpochId;
     uint256 public roundCount;
     /// @dev $CUSTOS staged here between receipt and next epoch open. Moves to epoch.rewardPool at openEpoch().
@@ -275,13 +277,14 @@ contract CustosMineController {
     // ============ Participation — CustosNetwork inscription-based ============
 
     /**
-     * @notice Round 1 only — register a commit inscription, nothing to reveal yet.
-     * @param roundId         Must be round 1 of the epoch (roundCount == 1)
-     * @param inscriptionId   The inscriptionId from agent's "mine-commit" inscription this loop
+     * @notice Commit-only registration — use when there is no prior round to reveal.
+     *         Typically round 1 of an epoch, or any round where the agent missed the previous commit.
+     * @param roundId         The current round (must be in commit window)
+     * @param inscriptionId   inscriptionId from agent's "mine-commit" inscription this loop
      *
-     * Agent must have already called proxy.inscribe() this loop with:
+     * Agent must have already called proxy.inscribe() with:
      *   blockType:   "mine-commit"
-     *   contentHash: keccak256(abi.encodePacked(answer_for_roundId, salt))
+     *   contentHash: keccak256(abi.encodePacked(answer, salt))
      */
     function registerCommit(
         uint256 roundId,
@@ -431,6 +434,7 @@ contract CustosMineController {
         external onlyOracle returns (uint256 roundId)
     {
         require(epochOpen,        "E10");
+        require(!epochClosing,    "E11");
         require(snapshotComplete, "E50");
         require(roundCount < ROUNDS_PER_EPOCH, "E40");
 
@@ -590,8 +594,12 @@ contract CustosMineController {
         if (end == total) snapshotComplete = true;
     }
 
+    /// @notice Begin epoch close sequence. Blocks new rounds from being posted.
+    /// @dev Must call accumulateCreditsBatch() then finalizeClose() to complete.
     function closeEpoch() external onlyOracle {
-        require(epochOpen, "E10");
+        require(epochOpen,    "E10");
+        require(!epochClosing, "E11");
+        epochClosing = true;
         creditCursor = 0;
     }
 
@@ -611,32 +619,43 @@ contract CustosMineController {
     }
 
     function finalizeClose() external onlyOracle {
-        require(epochOpen,                         "E10");
+        require(epochClosing,                        "E10");
         require(creditCursor >= stakedAgents.length, "E35");
         Epoch storage ep = epochs[currentEpochId];
         ep.settled = true;
         if (tierChangePending) {
-            tier1Threshold  = pendingTier1;
-            tier2Threshold  = pendingTier2;
-            tier3Threshold  = pendingTier3;
+            tier1Threshold    = pendingTier1;
+            tier2Threshold    = pendingTier2;
+            tier3Threshold    = pendingTier3;
             tierChangePending = false;
             emit TierThresholdsUpdated(tier1Threshold, tier2Threshold, tier3Threshold);
         }
-        uint256 i = 0;
-        while (i < stakedAgents.length) {
-            address wallet = stakedAgents[i];
-            if (stakes[wallet].withdrawalQueued) {
-                _removeFromStakedAgents(wallet);
-                stakes[wallet].stakedIndex = type(uint256).max;
-            } else {
-                i++;
-            }
-        }
         epochOpen        = false;
+        epochClosing     = false;
         snapshotComplete = false;
         creditCursor     = 0;
         snapshotCursor   = 0;
         emit EpochClosed(currentEpochId, ep.totalCredits, ep.rewardPool);
+    }
+
+    /// @notice Remove exited stakers from the active list in batches (call after finalizeClose).
+    /// @dev Stakers who queued unstake are flagged stakedIndex = type(uint256).max after removal.
+    function pruneExitedStakers(uint256 batchSize) external onlyOracle {
+        require(!epochOpen, "E11");
+        require(batchSize > 0, "E34");
+        uint256 i = 0;
+        uint256 removed = 0;
+        while (i < stakedAgents.length && removed < batchSize) {
+            address wallet = stakedAgents[i];
+            if (stakes[wallet].withdrawalQueued) {
+                _removeFromStakedAgents(wallet);
+                stakes[wallet].stakedIndex = type(uint256).max;
+                removed++;
+                // don't increment i — the swap moved a new element into slot i
+            } else {
+                i++;
+            }
+        }
     }
 
     /// @notice After the 30-day claim window, unclaimed $CUSTOS rolls into the next epoch's reward pool.

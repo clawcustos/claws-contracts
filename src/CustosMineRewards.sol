@@ -114,7 +114,7 @@ contract CustosMineRewards {
         // Always clear approval — even on failure path
         IERC20(WETH).approve(ALLOWANCE_HOLDER, 0);
 
-        require(success, "E42");
+        require(success, "E63");
 
         uint256 custosReceived = IERC20(CUSTOS_TOKEN).balanceOf(address(this)) - custosBalanceBefore;
         require(custosReceived >= minAmountOut, "E42");
