@@ -48,7 +48,7 @@ contract CustosNetworkProxyV056 is
     uint256 private constant _ENTERED = 2;
 
     modifier nonReentrant() {
-        require(_reentrancyStatus != _ENTERED, "reentrant call");
+        require(_reentrancyStatus != _ENTERED, "E62");
         _reentrancyStatus = _ENTERED;
         _;
         _reentrancyStatus = _NOT_ENTERED;
@@ -242,21 +242,21 @@ contract CustosNetworkProxyV056 is
     // ─── Modifiers ───────────────────────────────────────────────────────────
 
     modifier onlyCustodian() {
-        require(msg.sender == CUSTOS_CUSTODIAN || msg.sender == PIZZA_CUSTODIAN, "not custodian");
+        require(msg.sender == CUSTOS_CUSTODIAN || msg.sender == PIZZA_CUSTODIAN, "E22");
         _;
     }
 
     modifier onlyValidator() {
         uint256 id = agentIdByWallet[msg.sender];
-        require(id != 0, "not registered");
+        require(id != 0, "E20");
         Agent storage agent = agents[id];
-        require(agent.role == AgentRole.VALIDATOR, "not validator");
-        require(agent.subExpiresAt > block.timestamp, "subscription lapsed");
+        require(agent.role == AgentRole.VALIDATOR, "E21");
+        require(agent.subExpiresAt > block.timestamp, "E36");
         _;
     }
 
     modifier onlyRegistered() {
-        require(agentIdByWallet[msg.sender] != 0, "not registered");
+        require(agentIdByWallet[msg.sender] != 0, "E20");
         _;
     }
 
@@ -354,14 +354,14 @@ contract CustosNetworkProxyV056 is
 
         Agent storage agent = agents[agentId];
 
-        require(proofHash != bytes32(0),                           "zero proofHash");
-        require(prevHash == agent.chainHead,                       "invalid prevHash");
+        require(proofHash != bytes32(0),                           "E12");
+        require(prevHash == agent.chainHead,                       "E14");
         require(
             agent.lastInscriptionAt == 0 ||
             block.timestamp >= agent.lastInscriptionAt + MIN_INSCRIPTION_GAP,
-            "too fast"
+            "E44"
         );
-        require(bytes(summary).length <= 140,                     "summary too long");
+        require(bytes(summary).length <= 140,                     "E43");
 
         // Inscription fee split: $0.05 validatorPool | $0.04 buybackPool | $0.01 treasury
         IERC20(USDC).safeTransferFrom(msg.sender, address(this), INSCRIPTION_FEE);
@@ -420,16 +420,16 @@ contract CustosNetworkProxyV056 is
         string calldata content,
         bytes32 salt
     ) external {
-        require(inscriptionId > 0 && inscriptionId <= inscriptionCount, "invalid id");
-        require(inscriptionAgent[inscriptionId] == msg.sender,          "not inscriber");
-        require(!inscriptionRevealed[inscriptionId],                     "already revealed");
+        require(inscriptionId > 0 && inscriptionId <= inscriptionCount, "E15");
+        require(inscriptionAgent[inscriptionId] == msg.sender,          "E23");
+        require(!inscriptionRevealed[inscriptionId],                     "E31");
 
         bytes32 stored = inscriptionContentHash[inscriptionId];
-        require(stored != bytes32(0), "public inscription");
+        require(stored != bytes32(0), "E56");
 
         require(
             keccak256(abi.encodePacked(content, salt)) == stored,
-            "hash mismatch"
+            "E51"
         );
 
         inscriptionRevealed[inscriptionId]        = true;
@@ -447,7 +447,7 @@ contract CustosNetworkProxyV056 is
         external view
         returns (bool revealed, string memory content, bytes32 contentHash)
     {
-        require(inscriptionId > 0 && inscriptionId <= inscriptionCount, "invalid id");
+        require(inscriptionId > 0 && inscriptionId <= inscriptionCount, "E15");
         revealed    = inscriptionRevealed[inscriptionId];
         content     = revealed ? inscriptionRevealedContent[inscriptionId] : "";
         contentHash = inscriptionContentHash[inscriptionId];
@@ -466,7 +466,7 @@ contract CustosNetworkProxyV056 is
     function registerSkill(string calldata name, string calldata version, uint256 feePerExecution)
         external whenNotPaused nonReentrant
     {
-        require(bytes(name).length > 0 && bytes(version).length > 0 && feePerExecution > 0, "bad args");
+        require(bytes(name).length > 0 && bytes(version).length > 0 && feePerExecution > 0, "E58");
         uint256 agentId = agentIdByWallet[msg.sender];
         if (agentId == 0) {
             agentId = ++totalAgents;
@@ -489,7 +489,7 @@ contract CustosNetworkProxyV056 is
         SkillMetadata storage skill = skillMetadata[skillAgentId];
         require(skill.active && executionHash != bytes32(0), "invalid");
         uint256 clientAgentId = agentIdByWallet[msg.sender];
-        require(clientAgentId != 0 && clientAgentId != skillAgentId, "bad client");
+        require(clientAgentId != 0 && clientAgentId != skillAgentId, "E57");
         uint256 fee = skill.feePerExecution;
         IERC20(USDC).safeTransferFrom(msg.sender, address(this), fee * 2);
         uint256 execId = ++executionCount;
@@ -505,8 +505,8 @@ contract CustosNetworkProxyV056 is
 
     function claimPayment(uint256 executionId) external nonReentrant {
         ExecutionRecord storage exec = executions[executionId];
-        require(exec.fee > 0 && exec.status == ExecutionStatus.Pending, "not claimable");
-        require(block.timestamp >= exec.windowClosesAt, "window open");
+        require(exec.fee > 0 && exec.status == ExecutionStatus.Pending, "E29");
+        require(block.timestamp >= exec.windowClosesAt, "E40");
         Agent storage skill = agents[exec.skillAgentId];
         require(msg.sender == skill.wallet, "not skill");
         exec.status = ExecutionStatus.Released;
@@ -518,9 +518,9 @@ contract CustosNetworkProxyV056 is
 
     function fileDispute(uint256 executionId) external nonReentrant {
         ExecutionRecord storage exec = executions[executionId];
-        require(exec.status == ExecutionStatus.Pending, "not disputable");
-        require(block.timestamp < exec.windowClosesAt, "window closed");
-        require(agentIdByWallet[msg.sender] == exec.clientAgentId, "not client");
+        require(exec.status == ExecutionStatus.Pending, "E27");
+        require(block.timestamp < exec.windowClosesAt, "E41");
+        require(agentIdByWallet[msg.sender] == exec.clientAgentId, "E26");
         exec.status = ExecutionStatus.Disputed;
         DisputeRecord storage d = disputes[executionId];
         d.disputer = msg.sender;
@@ -530,12 +530,12 @@ contract CustosNetworkProxyV056 is
     }
 
     function voteOnDispute(uint256 executionId, bool uphold) external nonReentrant {
-        require(executions[executionId].status == ExecutionStatus.Disputed, "not disputed");
+        require(executions[executionId].status == ExecutionStatus.Disputed, "E28");
         DisputeRecord storage d = disputes[executionId];
         require(!d.resolved && block.timestamp < d.voteWindowEnd && !disputeVoted[executionId][msg.sender], "bad state");
         uint256 valId = agentIdByWallet[msg.sender];
         Agent storage val = agents[valId];
-        require(valId != 0 && val.role == AgentRole.VALIDATOR && val.subExpiresAt > block.timestamp, "not validator");
+        require(valId != 0 && val.role == AgentRole.VALIDATOR && val.subExpiresAt > block.timestamp, "E21");
         disputeVoted[executionId][msg.sender] = true;
         if (uphold) { d.votesForClient++; } else { d.votesForSkill++; }
         emit DisputeVoted(executionId, msg.sender, uphold);
@@ -633,35 +633,35 @@ contract CustosNetworkProxyV056 is
     // ─── Epoch Claims ─────────────────────────────────────────────────────────
 
     function claim(uint256 epochId) external nonReentrant onlyValidator {
-        require(epochId < currentEpoch, "epoch not closed");
-        require(!epochClaimed[epochId][msg.sender], "already claimed");
-        require(currentEpoch - epochId <= EPOCH_CLAIM_WINDOW, "claim window expired");
+        require(epochId < currentEpoch, "E37");
+        require(!epochClaimed[epochId][msg.sender], "E30");
+        require(currentEpoch - epochId <= EPOCH_CLAIM_WINDOW, "E42");
 
         uint256 points = validatorEpochPoints[epochId][msg.sender];
         uint256 total  = epochTotalPoints[epochId];
         uint256 inscriptions = epochInscriptionCount[epochId];
-        require(points > 0, "no points this epoch");
+        require(points > 0, "E53");
 
-        require(points * 10000 / inscriptions >= MIN_PARTICIPATION_BPS, "below participation threshold");
+        require(points * 10000 / inscriptions >= MIN_PARTICIPATION_BPS, "E46");
 
         epochClaimed[epochId][msg.sender] = true;
         // Use the immutable snapshot as the denominator so each validator's share is calculated
         // from the full epoch pool, regardless of claim order.
         // Deduct from the mutable remaining pool to ensure total claims never exceed the snapshot.
         uint256 snapshot = epochSnapshotPool[epochId];
-        require(snapshot > 0, "epoch pool empty");
+        require(snapshot > 0, "E39");
         uint256 reward   = snapshot * points / total;
         uint256 remaining = epochValidatorPool[epochId];
-        require(reward <= remaining, "reward exceeds remaining pool");
+        require(reward <= remaining, "E55");
         epochValidatorPool[epochId] = remaining - reward;
         IERC20(USDC).safeTransfer(msg.sender, reward);
         emit ValidatorRewardClaimed(msg.sender, reward);
     }
 
     function sweepExpiredEpoch(uint256 epochId) external nonReentrant {
-        require(currentEpoch - epochId > EPOCH_CLAIM_WINDOW, "epoch not expired");
+        require(currentEpoch - epochId > EPOCH_CLAIM_WINDOW, "E38");
         uint256 remaining = epochValidatorPool[epochId];
-        require(remaining > 0, "nothing to sweep");
+        require(remaining > 0, "E50");
         epochValidatorPool[epochId] = 0;
         buybackPool += remaining;
         emit EpochSweptToBuyback(epochId, remaining);
@@ -676,9 +676,9 @@ contract CustosNetworkProxyV056 is
         uint256 agentId = agentIdByWallet[msg.sender];
         Agent storage agent = agents[agentId];
 
-        require(agent.role != AgentRole.VALIDATOR, "already a validator");
-        require(agent.cycleCount >= VALIDATOR_INSCRIPTION_THRESHOLD, "insufficient inscriptions");
-        require(agent.subExpiresAt == 0, "pending subscription");
+        require(agent.role != AgentRole.VALIDATOR, "E32");
+        require(agent.cycleCount >= VALIDATOR_INSCRIPTION_THRESHOLD, "E47");
+        require(agent.subExpiresAt == 0, "E34");
 
         uint256 fee = validatorSubscriptionFee;
         IERC20(USDC).safeTransferFrom(msg.sender, TREASURY, fee);
@@ -696,7 +696,7 @@ contract CustosNetworkProxyV056 is
         uint256 agentId = agentIdByWallet[msg.sender];
         Agent storage agent = agents[agentId];
 
-        require(agent.role == AgentRole.VALIDATOR, "not a validator");
+        require(agent.role == AgentRole.VALIDATOR, "E24");
 
         uint256 fee = validatorSubscriptionFee;
         IERC20(USDC).safeTransferFrom(msg.sender, TREASURY, fee);
@@ -726,7 +726,7 @@ contract CustosNetworkProxyV056 is
      * @notice Custodian updates the validator subscription fee.
      */
     function setValidatorSubscriptionFee(uint256 newFee) external onlyCustodian {
-        require(newFee <= MAX_SUBSCRIPTION_FEE, "fee exceeds cap");
+        require(newFee <= MAX_SUBSCRIPTION_FEE, "E45");
         uint256 oldFee = validatorSubscriptionFee;
         validatorSubscriptionFee = newFee;
         emit SubscriptionFeeUpdated(oldFee, newFee);
@@ -737,8 +737,8 @@ contract CustosNetworkProxyV056 is
      */
     function lapseExpiredValidator(uint256 agentId) external onlyCustodian {
         Agent storage agent = agents[agentId];
-        require(agent.role == AgentRole.VALIDATOR, "not a validator");
-        require(agent.subExpiresAt <= block.timestamp, "subscription active");
+        require(agent.role == AgentRole.VALIDATOR, "E24");
+        require(agent.subExpiresAt <= block.timestamp, "E35");
 
         agent.role = AgentRole.INSCRIBER;
         agent.subExpiresAt = 0;
@@ -763,14 +763,14 @@ contract CustosNetworkProxyV056 is
         bytes calldata sig2
     ) external nonReentrant {
         // V5.3: Only custodians can challenge
-        require(msg.sender == CUSTOS_CUSTODIAN || msg.sender == PIZZA_CUSTODIAN, "not custodian");
+        require(msg.sender == CUSTOS_CUSTODIAN || msg.sender == PIZZA_CUSTODIAN, "E22");
 
         // V5.3: One challenge per epoch per challenger
-        require(!challengesIssuedThisEpoch[currentEpoch][msg.sender], "one challenge per epoch per challenger");
+        require(!challengesIssuedThisEpoch[currentEpoch][msg.sender], "E60");
 
         uint256 validatorAgentId = agentIdByWallet[validator];
-        require(validatorAgentId != 0, "not a registered agent");
-        require(agents[validatorAgentId].role == AgentRole.VALIDATOR, "not a validator");
+        require(validatorAgentId != 0, "E25");
+        require(agents[validatorAgentId].role == AgentRole.VALIDATOR, "E24");
 
         // Reconstruct and verify both signed messages
         // Each sig covers: keccak256(abi.encodePacked(proofHash, valid))
@@ -784,7 +784,7 @@ contract CustosNetworkProxyV056 is
         address signer1 = hash1.recover(sig1);
         address signer2 = hash2.recover(sig2);
 
-        require(signer1 == validator && signer2 == validator, "invalid signatures");
+        require(signer1 == validator && signer2 == validator, "E16");
 
         // Mark challenge as issued for this epoch
         challengesIssuedThisEpoch[currentEpoch][msg.sender] = true;
@@ -793,7 +793,7 @@ contract CustosNetworkProxyV056 is
         // Forfeit the validator's epoch points for this epoch to the challenger's pool share.
         // The subscription fee already paid is non-refundable.
         uint256 slashedPoints = validatorEpochPoints[currentEpoch][validator];
-        require(slashedPoints > 0, "no epoch points to slash");
+        require(slashedPoints > 0, "E54");
 
         // Zero out the validator's epoch points — they cannot claim this epoch
         validatorEpochPoints[currentEpoch][validator] = 0;
@@ -826,9 +826,9 @@ contract CustosNetworkProxyV056 is
         bytes calldata swapData,
         uint256 minCustosOut
     ) external onlyCustodian nonReentrant {
-        require(swapTarget == ALLOWANCE_HOLDER,           "must use allowance-holder");
-        require(usdcAmount > 0,                           "zero amount");
-        require(usdcAmount <= buybackPool,                "exceeds buyback pool");
+        require(swapTarget == ALLOWANCE_HOLDER,           "E61");
+        require(usdcAmount > 0,                           "E11");
+        require(usdcAmount <= buybackPool,                "E49");
 
         buybackPool -= usdcAmount;
 
@@ -840,12 +840,12 @@ contract CustosNetworkProxyV056 is
 
         // Execute swap
         (bool success,) = swapTarget.call(swapData);
-        require(success, "swap failed");
+        require(success, "E52");
 
         // Verify received amount
         uint256 custosAfter    = IERC20(CUSTOS_TOKEN).balanceOf(address(this));
         uint256 custosReceived = custosAfter - custosBefore;
-        require(custosReceived >= minCustosOut, "insufficient custos out");
+        require(custosReceived >= minCustosOut, "E48");
 
         // Reset any leftover allowance
         IERC20(USDC).approve(ALLOWANCE_HOLDER, 0);
@@ -862,7 +862,7 @@ contract CustosNetworkProxyV056 is
      * @notice Sweep any token balance to treasury. Either custodian.
      */
     function withdrawToTreasury(address token, uint256 amount) external onlyCustodian nonReentrant {
-        require(amount > 0, "zero amount");
+        require(amount > 0, "E11");
         IERC20(token).safeTransfer(TREASURY, amount);
     }
 
@@ -877,8 +877,8 @@ contract CustosNetworkProxyV056 is
         bytes32 genesisChainHead,
         uint256 genesisCycleCount
     ) external onlyCustodian {
-        require(!genesisSet[agentId],            "genesis already set");
-        require(agentId != 0 && agentId <= totalAgents, "invalid agentId");
+        require(!genesisSet[agentId],            "E33");
+        require(agentId != 0 && agentId <= totalAgents, "E13");
 
         genesisSet[agentId]         = true;
         agents[agentId].chainHead   = genesisChainHead;
@@ -894,7 +894,7 @@ contract CustosNetworkProxyV056 is
      * @notice Propose a new implementation. Both custodians must call with same address.
      */
     function proposeUpgrade(address newImpl) external onlyCustodian {
-        require(newImpl != address(0), "zero address");
+        require(newImpl != address(0), "E10");
         upgradeProposals[msg.sender] = newImpl;
         emit UpgradeProposed(msg.sender, newImpl);
     }
@@ -903,10 +903,10 @@ contract CustosNetworkProxyV056 is
      * @notice Confirm and execute upgrade if both custodians agree.
      */
     function confirmUpgrade(address newImpl) external onlyCustodian {
-        require(newImpl != address(0), "zero address");
+        require(newImpl != address(0), "E10");
 
         address other = (msg.sender == CUSTOS_CUSTODIAN) ? PIZZA_CUSTODIAN : CUSTOS_CUSTODIAN;
-        require(upgradeProposals[other] == newImpl, "other custodian has not proposed this impl");
+        require(upgradeProposals[other] == newImpl, "E59");
 
         // Note: do NOT clear proposals before upgradeToAndCall —
         // _authorizeUpgrade checks them during the upgrade call.
@@ -968,7 +968,7 @@ contract CustosNetworkProxyV056 is
         require(
             upgradeProposals[CUSTOS_CUSTODIAN] == newImplementation &&
             upgradeProposals[PIZZA_CUSTODIAN]  == newImplementation,
-            "requires 2-of-2 custodian approval"
+            "E59"
         );
     }
 }
