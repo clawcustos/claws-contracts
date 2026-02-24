@@ -60,6 +60,7 @@ contract CustosMineController {
         uint256 amount;
         bool withdrawalQueued;
         uint256 unstakeEpochId;
+        uint256 stakedIndex; // index in stakedAgents[] — enables O(1) removal
     }
     mapping(address => StakePosition) public stakes;
     address[] public stakedAgents;
@@ -106,6 +107,11 @@ contract CustosMineController {
     mapping(uint256 => Round) public rounds;
     mapping(uint256 => mapping(address => Submission)) public submissions;
     mapping(uint256 => address[]) internal _pendingReveals;
+
+    // Epoch open pagination (snapshot)
+    uint256 public snapshotCursor;   // index into stakedAgents[] — 0 = not started
+    bool public snapshotComplete;    // true once all agents snapshotted
+    uint256 public creditCursor;     // index for batched credit sum at closeEpoch
 
     // Credits + Claims
     mapping(uint256 => mapping(address => uint256)) public epochCredits;
@@ -179,9 +185,12 @@ contract CustosMineController {
         uint256 _tier2,
         uint256 _tier3
     ) {
+        require(_custosToken != address(0), "zero token");
+        require(_oracle != address(0), "zero oracle");
+        require(_tier1 > 0 && _tier1 < _tier2 && _tier2 < _tier3, "invalid tiers");
         owner = msg.sender;
         CUSTOS_TOKEN = _custosToken;
-        custosMineRewards = _custosMineRewards;
+        custosMineRewards = _custosMineRewards; // can be address(0) — set post-deploy
         oracle = _oracle;
         
         tier1Threshold = _tier1;
@@ -207,6 +216,7 @@ contract CustosMineController {
         
         if (!isStaked[msg.sender]) {
             isStaked[msg.sender] = true;
+            stakes[msg.sender].stakedIndex = stakedAgents.length;
             stakedAgents.push(msg.sender);
         }
         
@@ -265,8 +275,12 @@ contract CustosMineController {
         position.unstakeEpochId = 0;
         isStaked[msg.sender] = false;
         
-        // Remove from stakedAgents using swap-and-pop
-        _removeFromStakedAgents(msg.sender);
+        // Remove from stakedAgents (skip if already auto-removed by finalizeClose)
+        if (position.stakedIndex != type(uint256).max) {
+            _removeFromStakedAgents(msg.sender);
+        } else {
+            position.stakedIndex = 0; // clear sentinel
+        }
         
         IERC20(CUSTOS_TOKEN).safeTransfer(msg.sender, amount);
         
@@ -274,13 +288,15 @@ contract CustosMineController {
     }
 
     function _removeFromStakedAgents(address wallet) internal {
-        for (uint256 i = 0; i < stakedAgents.length; i++) {
-            if (stakedAgents[i] == wallet) {
-                stakedAgents[i] = stakedAgents[stakedAgents.length - 1];
-                stakedAgents.pop();
-                break;
-            }
+        uint256 idx = stakes[wallet].stakedIndex;
+        uint256 last = stakedAgents.length - 1;
+        if (idx != last) {
+            address moved = stakedAgents[last];
+            stakedAgents[idx] = moved;
+            stakes[moved].stakedIndex = idx; // update moved agent's index
         }
+        stakedAgents.pop();
+        stakes[wallet].stakedIndex = 0;
     }
 
     // ============ Participation Functions ============
@@ -370,6 +386,8 @@ contract CustosMineController {
      * @return roundId The ID of the newly created round
      */
     function postRound(string calldata questionUri, bytes32 answerHash) external onlyOracle returns (uint256 roundId) {
+        require(epochOpen, "No epoch open");
+        require(snapshotComplete, "Snapshot not complete");
         roundId = ++roundCount;
         
         uint256 commitOpen = block.timestamp;
@@ -520,6 +538,11 @@ contract CustosMineController {
      * @notice Open a new epoch (oracle only)
      * @param startAt Timestamp when epoch starts
      */
+    /**
+     * @notice Open a new epoch (oracle only).
+     *         After calling this, call snapshotBatch() until snapshotComplete == true
+     *         before posting any rounds. Rounds revert if snapshot not complete.
+     */
     function openEpoch(uint256 startAt) external onlyOracle {
         require(!epochOpen, "Epoch already open");
         
@@ -539,36 +562,94 @@ contract CustosMineController {
             claimDeadline: startAt + EPOCH_DURATION + CLAIM_WINDOW
         });
         
-        // Take tier snapshots for all staked agents
-        uint256 t1 = tier1Threshold;
-        uint256 t2 = tier2Threshold;
-        uint256 t3 = tier3Threshold;
-        
-        for (uint256 i = 0; i < stakedAgents.length; i++) {
-            address wallet = stakedAgents[i];
-            StakePosition storage stakePos = stakes[wallet];
-            
-            // Skip if withdrawal queued (exiting after this epoch)
-            if (stakePos.withdrawalQueued) continue;
-            
-            uint256 tier = _computeTier(stakePos.amount, t1, t2, t3);
-            tierSnapshot[epochId][wallet] = tier;
-        }
-        
         epochOpen = true;
+        snapshotCursor = 0;
+        snapshotComplete = stakedAgents.length == 0; // complete immediately if no stakers
         
         emit EpochOpened(epochId, startAt, startAt + EPOCH_DURATION, rewardPool);
     }
 
     /**
+     * @notice Snapshot tier positions for up to `batchSize` staked agents (oracle only).
+     *         Call repeatedly until snapshotComplete == true before posting rounds.
+     * @param batchSize Max agents to snapshot in this call
+     */
+    function snapshotBatch(uint256 batchSize) external onlyOracle {
+        require(epochOpen, "No epoch open");
+        require(!snapshotComplete, "Snapshot already complete");
+        require(batchSize > 0, "Zero batch size");
+        
+        uint256 epochId = currentEpochId;
+        uint256 t1 = tier1Threshold;
+        uint256 t2 = tier2Threshold;
+        uint256 t3 = tier3Threshold;
+        
+        uint256 cursor = snapshotCursor;
+        uint256 total = stakedAgents.length;
+        uint256 end = cursor + batchSize;
+        if (end > total) end = total;
+        
+        for (uint256 i = cursor; i < end; i++) {
+            address wallet = stakedAgents[i];
+            StakePosition storage stakePos = stakes[wallet];
+            // Skip if withdrawal queued (exiting after this epoch)
+            if (stakePos.withdrawalQueued) continue;
+            uint256 tier = _computeTier(stakePos.amount, t1, t2, t3);
+            tierSnapshot[epochId][wallet] = tier;
+        }
+        
+        snapshotCursor = end;
+        if (end == total) {
+            snapshotComplete = true;
+        }
+    }
+
+    /**
      * @notice Close current epoch (oracle only)
+     */
+    /**
+     * @notice Begin closing the current epoch (oracle only).
+     *         After calling this, call accumulateCreditsBatch() until creditCursor
+     *         reaches stakedAgents.length, then call finalizeClose().
+     *         If there are no stakers, call finalizeClose() directly.
      */
     function closeEpoch() external onlyOracle {
         require(epochOpen, "No epoch open");
+        creditCursor = 0;
+    }
+
+    /**
+     * @notice Accumulate epoch credits for up to `batchSize` agents (oracle only).
+     * @param batchSize Max agents to process in this call
+     */
+    function accumulateCreditsBatch(uint256 batchSize) external onlyOracle {
+        require(epochOpen, "No epoch open");
+        require(batchSize > 0, "Zero batch size");
+        
+        uint256 epochId = currentEpochId;
+        uint256 cursor = creditCursor;
+        uint256 total = stakedAgents.length;
+        uint256 end = cursor + batchSize;
+        if (end > total) end = total;
+        
+        Epoch storage epoch = epochs[epochId];
+        for (uint256 i = cursor; i < end; i++) {
+            epoch.totalCredits += epochCredits[epochId][stakedAgents[i]];
+        }
+        
+        creditCursor = end;
+    }
+
+    /**
+     * @notice Finalize epoch close after credit accumulation is complete (oracle only).
+     *         Also auto-removes agents who queued withdrawal during this epoch.
+     */
+    function finalizeClose() external onlyOracle {
+        require(epochOpen, "No epoch open");
+        require(creditCursor >= stakedAgents.length, "Credits not fully accumulated");
         
         Epoch storage epoch = epochs[currentEpochId];
         epoch.settled = true;
-        epoch.totalCredits = _calculateTotalCredits(currentEpochId);
         
         // Apply pending tier changes
         if (tierChangePending) {
@@ -576,11 +657,28 @@ contract CustosMineController {
             tier2Threshold = pendingTier2;
             tier3Threshold = pendingTier3;
             tierChangePending = false;
-            
             emit TierThresholdsUpdated(tier1Threshold, tier2Threshold, tier3Threshold);
         }
         
+        // Auto-remove agents with queued withdrawals from stakedAgents[]
+        // Marks stakedIndex = type(uint256).max as sentinel so withdrawStake skips re-removal
+        // They can still call withdrawStake() to collect their tokens
+        uint256 i = 0;
+        while (i < stakedAgents.length) {
+            address wallet = stakedAgents[i];
+            if (stakes[wallet].withdrawalQueued) {
+                _removeFromStakedAgents(wallet);
+                stakes[wallet].stakedIndex = type(uint256).max; // sentinel: already removed
+                // do not increment i — the swapped-in agent at index i needs checking
+            } else {
+                i++;
+            }
+        }
+        
         epochOpen = false;
+        snapshotComplete = false;
+        creditCursor = 0;
+        snapshotCursor = 0;
         
         emit EpochClosed(currentEpochId, epoch.totalCredits, epoch.rewardPool);
     }
@@ -698,9 +796,9 @@ contract CustosMineController {
      * @param newOracle New oracle address
      */
     function setOracle(address newOracle) external onlyCustodian {
+        require(newOracle != address(0), "zero oracle");
         address prev = oracle;
         oracle = newOracle;
-        
         emit OracleUpdated(prev, newOracle);
     }
 
@@ -709,9 +807,9 @@ contract CustosMineController {
      * @param newRewards New rewards contract address
      */
     function setCustosMineRewards(address newRewards) external onlyOwner {
+        require(newRewards != address(0), "zero address");
         address prev = custosMineRewards;
         custosMineRewards = newRewards;
-        
         emit MineRewardsUpdated(prev, newRewards);
     }
 
@@ -738,8 +836,8 @@ contract CustosMineController {
      * @param enabled True to enable, false to disable
      */
     function setCustodian(address account, bool enabled) external onlyOwner {
+        require(account != address(0), "zero address");
         custodians[account] = enabled;
-        
         emit CustodianSet(account, enabled);
     }
 
@@ -748,9 +846,9 @@ contract CustosMineController {
      * @param newOwner New owner address
      */
     function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "zero owner");
         address prev = owner;
         owner = newOwner;
-        
         emit OwnershipTransferred(prev, newOwner);
     }
 
@@ -959,16 +1057,7 @@ contract CustosMineController {
         return tier;
     }
 
-    /**
-     * @notice Calculate total credits for an epoch
-     * @param epochId Epoch ID
-     * @return total Total credits
-     */
-    function _calculateTotalCredits(uint256 epochId) internal view returns (uint256 total) {
-        for (uint256 i = 0; i < stakedAgents.length; i++) {
-            total += epochCredits[epochId][stakedAgents[i]];
-        }
-    }
+    // _calculateTotalCredits removed — replaced by accumulateCreditsBatch + finalizeClose
 
     // ============ Fallback ============
     receive() external payable {

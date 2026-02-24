@@ -102,6 +102,11 @@ contract MineTestBase is Test {
     function _openEpoch() internal {
         vm.prank(oracle);
         controller.openEpoch(block.timestamp);
+        // Only snapshot if not already complete (0 stakers = instantly complete)
+        if (!controller.snapshotComplete()) {
+            vm.prank(oracle);
+            controller.snapshotBatch(1000);
+        }
     }
 
     function _stakeMiner(address miner, uint256 amount) internal {
@@ -139,6 +144,11 @@ contract MineTestBase is Test {
     function _closeEpoch() internal {
         vm.prank(oracle);
         controller.closeEpoch();
+        // Accumulate credits for all agents in one batch, then finalize
+        vm.prank(oracle);
+        controller.accumulateCreditsBatch(1000);
+        vm.prank(oracle);
+        controller.finalizeClose();
     }
 }
 
