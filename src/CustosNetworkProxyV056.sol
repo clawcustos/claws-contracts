@@ -22,14 +22,6 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
  *   - attest-external-agents.sh simplified: just attest chainHead, contract rejects stale ones
  *   - Versioning: CHANGELOG convention switches to v0.x.x (pre-audit, unaudited code)
  *
- * V5.5 changes (carried forward):
- *   - Skill marketplace: any agent can register as a skill (name, version, feePerExecution)
- *   - Execution proofs: client agents inscribe keccak256(inputHash + outputHash + timestamp + skillAgentId)
- *   - Dispute bond: 1x skill fee posted by disputing client; loser forfeits bond
- *   - 24h auto-release: no dispute = payment auto-claimable by skill creator after window
- *   - Pull payment: skill creator calls claimPayment() after window closes
- *   - Validator dispute votes: majority resolves within 48h window
- *
  * Architecture:
  *   - Two custodians (Custos + Pizza), equal authority
  *   - 2-of-2 multisig required for upgrades only
@@ -107,48 +99,20 @@ contract CustosNetworkProxyV056 is
         uint256 timestamp;
     }
 
-    // V5.5 structs
-    struct SkillMetadata {
-        string  name;
-        string  version;
-        uint256 feePerExecution;  // USDC (6 decimals)
-        bool    active;
-    }
-
-    enum ExecutionStatus { Pending, Released, Disputed, ResolvedForClient, ResolvedForSkill }
-
-    struct ExecutionRecord {
-        uint256 skillAgentId;
-        uint256 clientAgentId;
-        bytes32 executionHash;   // keccak256(inputHash + outputHash + timestamp + skillAgentId)
-        uint256 fee;             // USDC locked at time of proveExecution
-        uint256 windowClosesAt;  // timestamp after which skill can claim (24h dispute window)
-        ExecutionStatus status;
-    }
-
-    struct DisputeRecord {
-        address disputer;        // client wallet
-        uint256 bondAmount;      // USDC bond posted (= fee)
-        uint256 votesForClient;  // validator votes upholding dispute
-        uint256 votesForSkill;   // validator votes rejecting dispute
-        uint256 voteWindowEnd;   // 48h from dispute filing
-        bool    resolved;
-        // hasVoted stored separately: disputeVoted[executionId][validator]
-    }
 
     // ─── Storage ─────────────────────────────────────────────────────────────
 
     // ── Slots 1-4: identical to V5 — DO NOT reorder ──────────────────────────
     uint256 public totalAgents;       // slot 1
     uint256 public totalCycles;       // slot 2
-    uint256 public epochPool;         // slot 3 — V5 name kept for layout compat, unused in V5.1+
+    uint256 public epochPool;         // slot 3 — legacy V5 variable, preserved for storage layout. Not written post-V5.1. Read as 0.
     uint256 public buybackPool;       // slot 4
 
     // ── Slots 5-10: mappings identical to V5 — DO NOT reorder ────────────────
     mapping(uint256 => Agent)         public agents;          // slot 5
     mapping(address => uint256)       public agentIdByWallet; // slot 6
     mapping(bytes32 => Attestation[]) public attestations;    // slot 7
-    mapping(address => uint256)       public validatorStakes; // slot 8
+    mapping(address => uint256)       public validatorStakes; // slot 8 — legacy stake deposits from V5 (pre-subscription model). Returned in initializeV53. Zero for all agents post-V5.3.
     mapping(uint256 => bool)          public genesisSet;      // slot 9
     mapping(address => address)       public upgradeProposals; // slot 10
 
@@ -170,6 +134,7 @@ contract CustosNetworkProxyV056 is
 
     // ── Slot 22+: V5.3 subscription storage — append only ────────────────────
     uint256 public validatorSubscriptionFee; // slot 22 — default 10 USDC
+    uint256 public validatorCount;           // slot 22b — tracks active validators. Incremented on subscribeValidator, decremented on lapse/slash. NOTE: initialises to 0 on V0.5.6 upgrade; accurate from upgrade onwards.
 
     // ── Slot 23: V5.3 equivocation challenge tracking ─────────────────────────
     mapping(uint256 => mapping(address => bool)) public challengesIssuedThisEpoch; // slot 23
@@ -182,24 +147,11 @@ contract CustosNetworkProxyV056 is
     mapping(bytes32 => uint256)  public proofHashToInscriptionId;       // slot 28
     mapping(uint256 => address)  public inscriptionAgent;               // slot 29
 
-    // ── Slot 30+: V5.5 skill marketplace — append only ───────────────────────
-    mapping(uint256 => SkillMetadata)    public skillMetadata;          // slot 30
-    uint256 public executionCount;                                      // slot 31
-    mapping(uint256 => ExecutionRecord)  public executions;             // slot 32
-    mapping(uint256 => DisputeRecord)    public disputes;               // slot 33
-    // executionId → USDC held in escrow (fee + bond if disputed)
-    mapping(uint256 => uint256)          public executionEscrow;        // slot 34
-    // skillAgentId → total USDC claimable by skill creator
-    mapping(uint256 => uint256)          public skillClaimable;         // slot 35
-    // executionId → validator → has voted
-    mapping(uint256 => mapping(address => bool)) public disputeVoted;  // slot 36
-
-    // ── Slot 37: V0.5.6 epoch-scoped attestation ─────────────────────────────
-    /// @notice Records which epoch a proofHash was inscribed in, offset by 1.
-    ///         Stored as (currentEpoch + 1) so epoch 0 proofs are distinguishable from "never set" (0).
-    ///         To read actual epoch: proofHashEpoch[hash] - 1
-    ///         proofHashEpoch[hash] == 0 means proof was never inscribed.
-    mapping(bytes32 => uint256) public proofHashEpoch;               // slot 37
+    // ── Slot 30: V0.5.6 epoch-scoped attestation ────────────────────────────────
+    /// @notice Records which epoch a proofHash was inscribed in.
+    ///         Set AFTER any epoch roll in inscribe() so it always equals currentEpoch
+    ///         at the time of inscription. proofHashEpoch[hash] == 0 means never inscribed.
+    mapping(bytes32 => uint256) public proofHashEpoch;               // slot 30
 
     // ─── Events ──────────────────────────────────────────────────────────────
 
@@ -226,14 +178,7 @@ contract CustosNetworkProxyV056 is
     // V5.4 commit-reveal events
     event ContentRevealed(uint256 indexed inscriptionId, bytes32 indexed proofHash, string content);
 
-    // V5.5 skill marketplace events
-    event SkillRegistered(uint256 indexed skillAgentId, string name, string version, uint256 feePerExecution);
-    event ExecutionProved(uint256 indexed executionId, uint256 indexed skillAgentId, uint256 indexed clientAgentId, bytes32 executionHash);
-    event DisputeFiled(uint256 indexed executionId, address indexed disputer, uint256 bondAmount);
-    event DisputeVoted(uint256 indexed executionId, address indexed validator, bool uphold);
-    event DisputeResolved(uint256 indexed executionId, bool clientWon);
-    event PaymentReleased(uint256 indexed executionId, uint256 indexed skillAgentId, uint256 amount);
-    event PaymentRefunded(uint256 indexed executionId, address indexed client, uint256 amount);
+
 
     // ─── Modifiers ───────────────────────────────────────────────────────────
 
@@ -305,7 +250,9 @@ contract CustosNetworkProxyV056 is
      * @notice V5.5 initializer — no state changes needed. New slots default to zero.
      */
     function initializeV056() external reinitializer(6) {
-        }
+        // No migrations needed — proofHashEpoch starts at zero for all existing proofs.
+        // validatorCount will be stale (0) after upgrade; lapseExpiredValidator guards this.
+    }
 
     // ─── Inscription (with auto-registration) ─────────────────────────────────
 
@@ -466,13 +413,11 @@ contract CustosNetworkProxyV056 is
         // Error key (off-chain reference):
         // E01 = invalid agentId
         // E02 = zero proofHash
-        // E03 = agent not found
         // E04 = proof not found (never inscribed)
         // E05 = proof not from current epoch (stale)
         // E06 = already attested this proof this epoch
         require(agentId != 0 && agentId <= totalAgents, "E01");
         require(proofHash != bytes32(0), "E02");
-        require(agents[agentId].wallet != address(0), "E03");
         require(proofHashToInscriptionId[proofHash] != 0, "E04");
         require(proofHashEpoch[proofHash] == currentEpoch, "E05");
         require(!hasAttested[currentEpoch][proofHash][msg.sender], "E06");
@@ -545,6 +490,7 @@ contract CustosNetworkProxyV056 is
 
         agent.role = AgentRole.VALIDATOR;
         agent.subExpiresAt = block.timestamp + SUBSCRIPTION_DURATION;
+        validatorCount += 1;
 
         emit ValidatorSubscribed(agentId, msg.sender, agent.subExpiresAt);
     }
@@ -602,6 +548,7 @@ contract CustosNetworkProxyV056 is
 
         agent.role = AgentRole.INSCRIBER;
         agent.subExpiresAt = 0;
+        if (validatorCount > 0) validatorCount -= 1;
         emit ValidatorLapsed(agentId, agent.wallet);
     }
 
@@ -662,6 +609,7 @@ contract CustosNetworkProxyV056 is
         // Demote validator immediately
         agents[validatorAgentId].role = AgentRole.INSCRIBER;
         agents[validatorAgentId].subExpiresAt = 0;
+        if (validatorCount > 0) validatorCount -= 1;
 
         // The slashed epoch pool share reverts to buyback pool (not to challenger —
         // challenger's reward is the reduced competition for epoch pool)
@@ -768,9 +716,8 @@ contract CustosNetworkProxyV056 is
         address other = (msg.sender == CUSTOS_CUSTODIAN) ? PIZZA_CUSTODIAN : CUSTOS_CUSTODIAN;
         require(upgradeProposals[other] == newImpl, "E59");
 
-        // Note: do NOT clear proposals before upgradeToAndCall —
-        // _authorizeUpgrade checks them during the upgrade call.
-        // They are cleared after successful upgrade.
+        // _authorizeUpgrade checks upgradeProposals during the call — must remain set.
+        // Cleared below after successful upgrade.
         upgradeToAndCall(newImpl, "");
 
         // Clear proposals after successful upgrade
@@ -810,11 +757,7 @@ contract CustosNetworkProxyV056 is
         uint256 _buybackPool,
         uint256 _validatorCount
     ) {
-        uint256 vCount;
-        for (uint256 i = 1; i <= totalAgents; i++) {
-            if (agents[i].role == AgentRole.VALIDATOR) vCount++;
-        }
-        return (totalAgents, totalCycles, validatorPool, buybackPool, vCount);
+        return (totalAgents, totalCycles, validatorPool, buybackPool, validatorCount);
     }
 
     // ─── UUPS ────────────────────────────────────────────────────────────────
