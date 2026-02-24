@@ -88,6 +88,7 @@ contract CustosMineController {
         string questionUri;
         bool settled;
         bool expired;
+        bool batchSettling; // true while settleBatch is in progress
         string revealedAnswer;
         uint256 correctCount;
         uint256 revealCount;
@@ -247,7 +248,14 @@ contract CustosMineController {
         require(position.withdrawalQueued, "No withdrawal queued");
         
         uint256 unstakeEpoch = position.unstakeEpochId;
-        require(epochOpen || epochs[unstakeEpoch].endAt < block.timestamp, "Epoch not ended");
+        // Must wait until the epoch queued for has ended:
+        // - If unstakeEpoch == 0 (queued before first epoch), wait until epoch 1 is closed
+        // - If unstakeEpoch > 0, wait until that epoch's endAt has passed AND no epoch is open
+        if (unstakeEpoch == 0) {
+            require(!epochOpen && currentEpochId > 0, "Epoch not ended");
+        } else {
+            require(!epochOpen && epochs[unstakeEpoch].settled, "Epoch not ended");
+        }
         
         uint256 amount = position.amount;
         
@@ -285,6 +293,7 @@ contract CustosMineController {
     function commit(uint256 roundId, bytes32 commitHash) external notPaused {
         require(epochOpen, "No epoch open");
         require(tierSnapshot[currentEpochId][msg.sender] > 0, "Not staked for epoch");
+        require(rounds[roundId].epochId == currentEpochId, "Round not in current epoch");
         require(rounds[roundId].commitOpenAt <= block.timestamp, "Commit not open");
         require(rounds[roundId].commitCloseAt > block.timestamp, "Commit closed");
         
@@ -377,6 +386,7 @@ contract CustosMineController {
             questionUri: questionUri,
             settled: false,
             expired: false,
+            batchSettling: false,
             revealedAnswer: "",
             correctCount: 0,
             revealCount: 0
@@ -393,6 +403,8 @@ contract CustosMineController {
     function settleRound(uint256 roundId, string calldata correctAnswer) external onlyOracle {
         require(!rounds[roundId].settled, "Already settled");
         require(!rounds[roundId].expired, "Already expired");
+        require(!rounds[roundId].batchSettling, "Batch settle in progress");
+        require(keccak256(abi.encodePacked(correctAnswer)) == rounds[roundId].answerHash, "Answer mismatch");
         
         Round storage round = rounds[roundId];
         address[] storage pending = _pendingReveals[roundId];
@@ -442,10 +454,18 @@ contract CustosMineController {
     ) external onlyOracle {
         require(!rounds[roundId].settled, "Already settled");
         require(!rounds[roundId].expired, "Already expired");
+        // Verify correctAnswer matches the committed answerHash — prevents oracle from
+        // using different answers across batches
+        require(keccak256(abi.encodePacked(correctAnswer)) == rounds[roundId].answerHash, "Answer mismatch");
+        // Mark batch settling in progress — blocks settleRound from running in parallel
+        if (!rounds[roundId].batchSettling) {
+            rounds[roundId].batchSettling = true;
+        }
         
         Round storage round = rounds[roundId];
         address[] storage pending = _pendingReveals[roundId];
         
+        require(start < end, "Empty batch");
         require(end <= pending.length, "End out of bounds");
         
         uint256 correctCount = 0;
@@ -588,12 +608,12 @@ contract CustosMineController {
         require(amount > 0, "Amount must be > 0");
         
         uint256 balance = IERC20(CUSTOS_TOKEN).balanceOf(address(this));
-        // Account for any existing staked amounts
+        // Account for all locked amounts: staked tokens + pending rewards + active epoch pool
         uint256 available = balance;
         for (uint256 i = 0; i < stakedAgents.length; i++) {
             available -= stakes[stakedAgents[i]].amount;
         }
-        // Subtract any epoch reward pools if open
+        available -= pendingRewards;
         if (epochOpen) {
             available -= epochs[currentEpochId].rewardPool;
         }
@@ -610,6 +630,7 @@ contract CustosMineController {
      * @param amount Amount received
      */
     function receiveCustos(uint256 amount) external {
+        require(custosMineRewards != address(0), "Rewards not set");
         require(msg.sender == custosMineRewards, "Only rewards contract");
         
         pendingRewards += amount;
@@ -641,13 +662,21 @@ contract CustosMineController {
      * @param to Recipient address
      */
     function recoverERC20(address token, uint256 amount, address to) external onlyCustodian {
-        uint256 protectedAmount = pendingRewards;
-        if (epochOpen) {
-            protectedAmount += epochs[currentEpochId].rewardPool;
+        require(to != address(0), "zero recipient");
+        // If recovering CUSTOS, protect staked amounts + reward pool
+        uint256 protectedAmount = 0;
+        if (token == CUSTOS_TOKEN) {
+            protectedAmount = pendingRewards;
+            if (epochOpen) {
+                protectedAmount += epochs[currentEpochId].rewardPool;
+            }
+            for (uint256 i = 0; i < stakedAgents.length; i++) {
+                protectedAmount += stakes[stakedAgents[i]].amount;
+            }
         }
         
         uint256 tokenBalance = IERC20(token).balanceOf(address(this));
-        require(tokenBalance - protectedAmount >= amount, "Insufficient available");
+        require(tokenBalance >= protectedAmount + amount, "Insufficient available");
         
         IERC20(token).safeTransfer(to, amount);
     }
@@ -657,14 +686,11 @@ contract CustosMineController {
      * @param to Recipient address
      */
     function recoverETH(address payable to) external onlyCustodian {
-        uint256 protectedAmount = pendingRewards;
-        if (epochOpen) {
-            protectedAmount += epochs[currentEpochId].rewardPool;
-        }
-        
-        require(address(this).balance - protectedAmount > 0, "No ETH available");
-        
-        (bool success,) = to.call{value: address(this).balance - protectedAmount}(""); require(success, "ETH transfer failed");
+        require(to != address(0), "zero recipient");
+        uint256 bal = address(this).balance;
+        require(bal > 0, "No ETH");
+        (bool success,) = to.call{value: bal}("");
+        require(success, "ETH transfer failed");
     }
 
     /**
@@ -750,11 +776,7 @@ contract CustosMineController {
      * @notice Set epoch duration (owner only)
      * @param duration New duration
      */
-    function setEpochDuration(uint256 duration) external onlyOwner {
-        require(duration > 0, "Duration must be > 0");
-        // Note: This only affects future epochs, not current
-        // Could add a new state variable if dynamic duration needed
-    }
+
 
     // ============ View Functions ============
 
@@ -763,8 +785,17 @@ contract CustosMineController {
      * @return Round Current round or empty if no rounds
      */
     function getCurrentRound() external view returns (Round memory) {
-        if (roundCount == 0) { return Round(0, 0, 0, 0, 0, bytes32(0), "", false, false, "", 0, 0); }
+        if (roundCount == 0) { return Round(0, 0, 0, 0, 0, bytes32(0), "", false, false, false, "", 0, 0); }
         return rounds[roundCount];
+    }
+
+    /**
+     * @notice Get round by ID
+     * @param roundId Round ID
+     * @return Round data
+     */
+    function getRound(uint256 roundId) external view returns (Round memory) {
+        return rounds[roundId];
     }
 
     /**

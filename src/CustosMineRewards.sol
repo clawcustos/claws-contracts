@@ -108,28 +108,29 @@ contract CustosMineRewards {
         bytes calldata swapCalldata,
         uint256 minAmountOut
     ) external onlyAuthorised {
-        uint256 wethBalance = IERC20(WETH).balanceOf(address(this));
-        require(wethBalance > 0, "no WETH to swap");
+        uint256 wethIn = IERC20(WETH).balanceOf(address(this));
+        require(wethIn > 0, "no WETH to swap");
 
         // Approve allowance-holder to spend WETH
-        IERC20(WETH).approve(ALLOWANCE_HOLDER, wethBalance);
+        IERC20(WETH).approve(ALLOWANCE_HOLDER, wethIn);
 
         // Execute swap via 0x allowance-holder
         uint256 custosBalanceBefore = IERC20(CUSTOS_TOKEN).balanceOf(address(this));
         (bool success,) = ALLOWANCE_HOLDER.call(swapCalldata);
+
+        // Always clear approval — even on failure path
+        IERC20(WETH).approve(ALLOWANCE_HOLDER, 0);
+
         require(success, "swap failed");
 
         uint256 custosReceived = IERC20(CUSTOS_TOKEN).balanceOf(address(this)) - custosBalanceBefore;
         require(custosReceived >= minAmountOut, "slippage exceeded");
 
-        // Clear any residual approval
-        IERC20(WETH).approve(ALLOWANCE_HOLDER, 0);
-
         // Forward to controller and notify it for accounting
         IERC20(CUSTOS_TOKEN).safeTransfer(controller, custosReceived);
         ICustosMineController(controller).receiveCustos(custosReceived);
 
-        emit SwappedAndSent(wethBalance, custosReceived, controller);
+        emit SwappedAndSent(wethIn, custosReceived, controller);
     }
 
     /**
@@ -188,7 +189,7 @@ contract CustosMineRewards {
         oracle = newOracle;
     }
 
-    function setController(address newController) external onlyCustodian {
+    function setController(address newController) external onlyOwner {
         require(newController != address(0), "zero");
         emit ControllerUpdated(controller, newController);
         controller = newController;

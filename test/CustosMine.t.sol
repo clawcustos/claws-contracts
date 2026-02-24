@@ -688,3 +688,173 @@ contract CustosMineRewardsTest is MineTestBase {
         rewards.recoverFunds(address(weth), 1, custodian);
     }
 }
+
+// ─── Security fix tests ────────────────────────────────────────────────────────
+
+contract MineControllerSecurityTest is MineTestBase {
+
+    function setUp() public override {
+        super.setUp();
+        controller.setCustodian(custodian, true);
+    }
+
+    // FIX1: withdrawStake should NOT be allowed during an open epoch
+    function test_withdrawStake_revertsIfEpochOpen() public {
+        _stakeMiner(miner1, T1);
+        _openEpoch(); // epoch 1 now open
+
+        // Unstake during open epoch — unstakeEpochId = 1
+        vm.prank(miner1);
+        controller.unstake();
+
+        // Try to withdraw immediately — epoch still open
+        vm.prank(miner1);
+        vm.expectRevert("Epoch not ended");
+        controller.withdrawStake();
+    }
+
+    // FIX1: withdrawStake allowed after epoch ends
+    function test_withdrawStake_succeedsAfterEpochEnds() public {
+        _stakeMiner(miner1, T1);
+
+        vm.prank(miner1);
+        controller.unstake();
+
+        _openEpoch();
+        _closeEpoch();
+        // Epoch is closed, warp past endAt
+        vm.warp(block.timestamp + 86401);
+
+        vm.prank(miner1);
+        controller.withdrawStake(); // should succeed
+        assertFalse(controller.isStaked(miner1));
+    }
+
+    // FIX2: seedRewards double-seed should revert
+    function test_seedRewards_preventsDoubleSeed() public {
+        uint256 amt = 500_000e18;
+        custos.mint(address(controller), amt);
+        vm.prank(custodian);
+        controller.seedRewards(amt);
+        // pendingRewards = amt, balance = amt. No free balance left.
+        vm.prank(custodian);
+        vm.expectRevert("Insufficient balance");
+        controller.seedRewards(1); // nothing left to seed
+    }
+
+    // FIX3: receiveCustos reverts if custosMineRewards is address(0)
+    function test_receiveCustos_revertsIfRewardsNotSet() public {
+        // Deploy a fresh controller with address(0) as rewardsAddress
+        CustosMineController fresh = new CustosMineController(
+            address(custos),
+            address(0), // not set
+            oracle,
+            T1, T2, T3
+        );
+        vm.expectRevert("Rewards not set");
+        fresh.receiveCustos(100e18);
+    }
+
+    // FIX4: commit should revert for a round from a previous epoch
+    function test_commit_revertsStaleEpochRound() public {
+        _stakeMiner(miner1, T1);
+        _openEpoch(); // epoch 1
+
+        // Post round in epoch 1
+        vm.prank(oracle);
+        uint256 rid = controller.postRound("ipfs://stale", keccak256("answer"));
+
+        // Close epoch 1, open epoch 2
+        _closeEpoch();
+        _openEpoch(); // epoch 2 — miner1 was not queued for withdrawal so re-snapshotted
+
+        // Try to commit to epoch-1 round during epoch 2
+        bytes32 ch = keccak256(abi.encodePacked("answer", bytes32("salt")));
+        vm.prank(miner1);
+        vm.expectRevert("Round not in current epoch");
+        controller.commit(rid, ch);
+    }
+
+    // FIX5: settleRound should revert with wrong answer (not matching answerHash)
+    function test_settleRound_revertsWrongAnswer() public {
+        _stakeMiner(miner1, T1);
+        _openEpoch();
+        bytes32 ah = keccak256(abi.encodePacked("correct"));
+        vm.prank(oracle);
+        uint256 rid = controller.postRound("ipfs://q", ah);
+
+        CustosMineController.Round memory rnd = controller.getRound(rid);
+        vm.warp(rnd.revealCloseAt + 1);
+
+        vm.prank(oracle);
+        vm.expectRevert("Answer mismatch");
+        controller.settleRound(rid, "wrong_answer");
+    }
+
+    // FIX5: settleBatch should revert with wrong answer
+    function test_settleBatch_revertsWrongAnswer() public {
+        _stakeMiner(miner1, T1);
+        _openEpoch();
+        bytes32 ah = keccak256(abi.encodePacked("correct"));
+        vm.prank(oracle);
+        uint256 rid = controller.postRound("ipfs://q", ah);
+
+        CustosMineController.Round memory rnd = controller.getRound(rid);
+        vm.warp(rnd.revealCloseAt + 1);
+
+        vm.prank(oracle);
+        vm.expectRevert("Answer mismatch");
+        controller.settleBatch(rid, 0, 0, "wrong_answer");
+    }
+
+    // FIX9: settleRound should revert if batchSettling in progress
+    function test_settleRound_revertsIfBatchSettling() public {
+        _stakeMiner(miner1, T1);
+        _stakeMiner(miner2, T2);
+        _openEpoch();
+        bytes32 ah = keccak256(abi.encodePacked("correct"));
+        vm.prank(oracle);
+        uint256 rid = controller.postRound("ipfs://q", ah);
+
+        // Both miners commit
+        bytes32 salt = keccak256("s");
+        _commit(miner1, rid, "correct", salt);
+        _commit(miner2, rid, "correct", salt);
+
+        CustosMineController.Round memory rnd = controller.getRound(rid);
+        vm.warp(rnd.commitCloseAt + 1);
+        _reveal(miner1, rid, "correct", salt);
+        _reveal(miner2, rid, "correct", salt);
+        vm.warp(rnd.revealCloseAt + 1);
+
+        // First call to settleBatch: settle only first revealer — sets batchSettling = true, not yet settled
+        vm.prank(oracle);
+        controller.settleBatch(rid, 0, 1, "correct"); // partial batch, batchSettling=true
+
+        // Now settleRound should revert because batchSettling is in progress
+        vm.prank(oracle);
+        vm.expectRevert("Batch settle in progress");
+        controller.settleRound(rid, "correct");
+    }
+
+    // FIX6: recoverERC20 on CUSTOS should not drain staked tokens
+    function test_recoverERC20_cannotDrainStakes() public {
+        _stakeMiner(miner1, T1); // T1 staked into controller
+
+        // No extra CUSTOS in contract — all is staked
+        vm.prank(custodian);
+        vm.expectRevert("Insufficient available");
+        controller.recoverERC20(address(custos), 1, custodian);
+    }
+
+    // FIX6: recoverERC20 on CUSTOS allows recovering truly free tokens
+    function test_recoverERC20_allowsFreeTokens() public {
+        _stakeMiner(miner1, T1);
+        // Send 100 extra CUSTOS directly (not via stake/seed)
+        custos.mint(address(controller), 100e18);
+
+        vm.prank(custodian);
+        controller.recoverERC20(address(custos), 100e18, custodian);
+        assertEq(custos.balanceOf(custodian), 100e18);
+    }
+}
