@@ -22,8 +22,8 @@ contract CustosMineController {
     using SafeERC20 for IERC20;
 
     // ============ Constants ============
-    uint256 public constant COMMIT_WINDOW = 600;
-    uint256 public constant REVEAL_WINDOW = 300;
+    uint256 public constant COMMIT_WINDOW = 600;  // 10 min — agents commit during loop N
+    uint256 public constant REVEAL_WINDOW = 600;  // 10 min — agents reveal during loop N+1 (same duration, overlaps with next commit)
     uint256 public constant EPOCH_DURATION = 86400;
     uint256 public constant CLAIM_WINDOW = 30 days;
     uint256 public constant MAX_REVEALERS_PER_ROUND = 500;
