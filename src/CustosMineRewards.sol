@@ -25,8 +25,9 @@ contract CustosMineRewards {
 
     // ─── State ────────────────────────────────────────────────────────────────
 
+    address public owner;
+    mapping(address => bool) public custodians;
     address public oracle;
-    address public custodian;
     address public controller;      // CustosMineController
 
     address public immutable WETH;
@@ -39,38 +40,53 @@ contract CustosMineRewards {
     event OracleUpdated(address indexed oldOracle, address indexed newOracle);
     event ControllerUpdated(address indexed oldController, address indexed newController);
     event FundsRecovered(address indexed token, uint256 amount, address indexed to);
+    event ETHRecovered(uint256 amount, address indexed to);
+    event OwnershipTransferred(address indexed prev, address indexed next);
+    event CustodianSet(address indexed account, bool enabled);
 
     // ─── Modifiers ────────────────────────────────────────────────────────────
 
-    modifier onlyAuthorised() {
-        require(msg.sender == oracle || msg.sender == custodian, "not authorised");
+    modifier onlyOwner() {
+        require(msg.sender == owner, "not owner");
         _;
     }
 
     modifier onlyCustodian() {
-        require(msg.sender == custodian, "not custodian");
+        require(custodians[msg.sender], "not custodian");
+        _;
+    }
+
+    modifier onlyAuthorised() {
+        require(msg.sender == oracle || custodians[msg.sender], "not authorised");
         _;
     }
 
     // ─── Constructor ──────────────────────────────────────────────────────────
 
     constructor(
+        address _owner,
+        address[] memory _custodians,
         address _oracle,
-        address _custodian,
         address _controller,
         address _weth,
         address _custosToken,
         address _allowanceHolder
     ) {
+        require(_owner != address(0), "zero owner");
         require(_oracle != address(0), "zero oracle");
-        require(_custodian != address(0), "zero custodian");
+        require(_custodians.length > 0, "no custodians");
         require(_controller != address(0), "zero controller");
         require(_weth != address(0), "zero weth");
         require(_custosToken != address(0), "zero token");
         require(_allowanceHolder != address(0), "zero router");
 
+        owner = _owner;
+        for (uint256 i = 0; i < _custodians.length; i++) {
+            require(_custodians[i] != address(0), "zero custodian");
+            custodians[_custodians[i]] = true;
+            emit CustodianSet(_custodians[i], true);
+        }
         oracle = _oracle;
-        custodian = _custodian;
         controller = _controller;
         WETH = _weth;
         CUSTOS_TOKEN = _custosToken;
@@ -142,6 +158,28 @@ contract CustosMineRewards {
         require(to != address(0), "zero recipient");
         IERC20(token).safeTransfer(to, amount);
         emit FundsRecovered(token, amount, to);
+    }
+
+    /// @notice Recover stuck ETH. Custodian only.
+    function recoverETH(address payable to) external onlyCustodian {
+        require(to != address(0), "zero recipient");
+        uint256 bal = address(this).balance;
+        require(bal > 0, "no ETH");
+        (bool ok,) = to.call{value: bal}("");
+        require(ok, "ETH transfer failed");
+        emit ETHRecovered(bal, to);
+    }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "zero owner");
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+
+    function setCustodian(address account, bool enabled) external onlyOwner {
+        require(account != address(0), "zero address");
+        custodians[account] = enabled;
+        emit CustodianSet(account, enabled);
     }
 
     function setOracle(address newOracle) external onlyCustodian {

@@ -82,11 +82,7 @@ contract CustosNetworkProxyV056 is
     uint256 public constant VALIDATOR_INSCRIPTION_THRESHOLD = 144; // cycles needed before subscribing
     uint256 public constant SUBSCRIPTION_DURATION = 30 days;      // 30 days
 
-    // V5.5 skill marketplace constants
-    uint256 public constant SKILL_INSCRIPTION_FEE = 10_000;      // 0.01 USDC — discounted vs work agents
-    uint256 public constant DISPUTE_WINDOW        = 24 hours;    // auto-release after this
-    uint256 public constant VOTE_WINDOW           = 48 hours;    // validator vote period
-    uint256 public constant MIN_DISPUTE_VOTES     = 2;           // minimum validators needed to resolve
+
 
     // ─── Enums & Structs ─────────────────────────────────────────────────────
 
@@ -309,8 +305,7 @@ contract CustosNetworkProxyV056 is
      * @notice V5.5 initializer — no state changes needed. New slots default to zero.
      */
     function initializeV056() external reinitializer(6) {
-        // executionCount = 0, all skill mappings start empty.
-    }
+        }
 
     // ─── Inscription (with auto-registration) ─────────────────────────────────
 
@@ -451,141 +446,6 @@ contract CustosNetworkProxyV056 is
         revealed    = inscriptionRevealed[inscriptionId];
         content     = revealed ? inscriptionRevealedContent[inscriptionId] : "";
         contentHash = inscriptionContentHash[inscriptionId];
-    }
-
-    // ─── Skill Marketplace (V5.5) ────────────────────────────────────────────
-
-    /**
-     * @notice Register an existing agent as a skill with fee and metadata.
-     *         The caller must already be registered (auto-registers on first inscribe).
-     *         Pays SKILL_INSCRIPTION_FEE (0.01 USDC) instead of full INSCRIPTION_FEE.
-     * @param name             Human-readable skill name.
-     * @param version          Semver string (e.g. "1.0.0").
-     * @param feePerExecution  USDC (6 decimals) per execution proof.
-     */
-    function registerSkill(string calldata name, string calldata version, uint256 feePerExecution)
-        external whenNotPaused nonReentrant
-    {
-        require(bytes(name).length > 0 && bytes(version).length > 0 && feePerExecution > 0, "E58");
-        uint256 agentId = agentIdByWallet[msg.sender];
-        if (agentId == 0) {
-            agentId = ++totalAgents;
-            agentIdByWallet[msg.sender] = agentId;
-            agents[agentId] = Agent({
-                agentId: agentId, wallet: msg.sender, name: name,
-                role: AgentRole.INSCRIBER, cycleCount: 0, chainHead: bytes32(0),
-                registeredAt: block.timestamp, lastInscriptionAt: 0, active: true, subExpiresAt: 0
-            });
-            emit AgentRegistered(agentId, msg.sender, name);
-        }
-        IERC20(USDC).safeTransferFrom(msg.sender, TREASURY, SKILL_INSCRIPTION_FEE);
-        skillMetadata[agentId] = SkillMetadata({ name: name, version: version, feePerExecution: feePerExecution, active: true });
-        emit SkillRegistered(agentId, name, version, feePerExecution);
-    }
-
-    function proveExecution(uint256 skillAgentId, bytes32 executionHash)
-        external whenNotPaused nonReentrant
-    {
-        SkillMetadata storage skill = skillMetadata[skillAgentId];
-        require(skill.active && executionHash != bytes32(0), "invalid");
-        uint256 clientAgentId = agentIdByWallet[msg.sender];
-        require(clientAgentId != 0 && clientAgentId != skillAgentId, "E57");
-        uint256 fee = skill.feePerExecution;
-        IERC20(USDC).safeTransferFrom(msg.sender, address(this), fee * 2);
-        uint256 execId = ++executionCount;
-        executions[execId] = ExecutionRecord({
-            skillAgentId: skillAgentId, clientAgentId: clientAgentId,
-            executionHash: executionHash, fee: fee,
-            windowClosesAt: block.timestamp + DISPUTE_WINDOW,
-            status: ExecutionStatus.Pending
-        });
-        executionEscrow[execId] = fee * 2;
-        emit ExecutionProved(execId, skillAgentId, clientAgentId, executionHash);
-    }
-
-    function claimPayment(uint256 executionId) external nonReentrant {
-        ExecutionRecord storage exec = executions[executionId];
-        require(exec.fee > 0 && exec.status == ExecutionStatus.Pending, "E29");
-        require(block.timestamp >= exec.windowClosesAt, "E40");
-        Agent storage skill = agents[exec.skillAgentId];
-        require(msg.sender == skill.wallet, "not skill");
-        exec.status = ExecutionStatus.Released;
-        executionEscrow[executionId] = 0;
-        IERC20(USDC).safeTransfer(skill.wallet, exec.fee);
-        IERC20(USDC).safeTransfer(agents[exec.clientAgentId].wallet, exec.fee);
-        emit PaymentReleased(executionId, exec.skillAgentId, exec.fee);
-    }
-
-    function fileDispute(uint256 executionId) external nonReentrant {
-        ExecutionRecord storage exec = executions[executionId];
-        require(exec.status == ExecutionStatus.Pending, "E27");
-        require(block.timestamp < exec.windowClosesAt, "E41");
-        require(agentIdByWallet[msg.sender] == exec.clientAgentId, "E26");
-        exec.status = ExecutionStatus.Disputed;
-        DisputeRecord storage d = disputes[executionId];
-        d.disputer = msg.sender;
-        d.bondAmount = exec.fee;
-        d.voteWindowEnd = block.timestamp + VOTE_WINDOW;
-        emit DisputeFiled(executionId, msg.sender, exec.fee);
-    }
-
-    function voteOnDispute(uint256 executionId, bool uphold) external nonReentrant {
-        require(executions[executionId].status == ExecutionStatus.Disputed, "E28");
-        DisputeRecord storage d = disputes[executionId];
-        require(!d.resolved && block.timestamp < d.voteWindowEnd && !disputeVoted[executionId][msg.sender], "bad state");
-        uint256 valId = agentIdByWallet[msg.sender];
-        Agent storage val = agents[valId];
-        require(valId != 0 && val.role == AgentRole.VALIDATOR && val.subExpiresAt > block.timestamp, "E21");
-        disputeVoted[executionId][msg.sender] = true;
-        if (uphold) { d.votesForClient++; } else { d.votesForSkill++; }
-        emit DisputeVoted(executionId, msg.sender, uphold);
-        uint256 total = d.votesForClient + d.votesForSkill;
-        if (total >= MIN_DISPUTE_VOTES) {
-            if (d.votesForClient > d.votesForSkill)      _resolveDispute(executionId, true);
-            else if (d.votesForSkill > d.votesForClient) _resolveDispute(executionId, false);
-        }
-    }
-
-    function resolveDisputeAdmin(uint256 executionId, bool clientWins) external onlyCustodian {
-        require(executions[executionId].status == ExecutionStatus.Disputed && !disputes[executionId].resolved, "bad state");
-        _resolveDispute(executionId, clientWins);
-    }
-
-    function _resolveDispute(uint256 executionId, bool clientWins) internal {
-        ExecutionRecord storage exec = executions[executionId];
-        DisputeRecord storage d = disputes[executionId];
-        d.resolved = true;
-        executionEscrow[executionId] = 0;
-        uint256 total = exec.fee + d.bondAmount;
-        if (clientWins) {
-            exec.status = ExecutionStatus.ResolvedForClient;
-            address cw = agents[exec.clientAgentId].wallet;
-            IERC20(USDC).safeTransfer(cw, total);
-            emit PaymentRefunded(executionId, cw, total);
-        } else {
-            exec.status = ExecutionStatus.ResolvedForSkill;
-            address sw = agents[exec.skillAgentId].wallet;
-            IERC20(USDC).safeTransfer(sw, total);
-            emit PaymentReleased(executionId, exec.skillAgentId, total);
-        }
-        emit DisputeResolved(executionId, clientWins);
-    }
-
-    function deactivateSkill(uint256 agentId) external onlyCustodian {
-        require(skillMetadata[agentId].active, "inactive");
-        skillMetadata[agentId].active = false;
-    }
-
-    function getSkillMetadata(uint256 agentId) external view returns (SkillMetadata memory) {
-        return skillMetadata[agentId];
-    }
-
-    function getExecution(uint256 executionId) external view returns (ExecutionRecord memory) {
-        return executions[executionId];
-    }
-
-    function getDisputeBond(uint256 executionId) external view returns (uint256) {
-        return disputes[executionId].bondAmount;
     }
 
     // ─── Attestation ─────────────────────────────────────────────────────────

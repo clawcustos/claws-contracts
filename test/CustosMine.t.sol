@@ -78,9 +78,12 @@ contract MineTestBase is Test {
             T1, T2, T3
         );
 
+        address[] memory rewardsCustodians = new address[](1);
+        rewardsCustodians[0] = custodian;
         rewards = new CustosMineRewards(
+            owner,
+            rewardsCustodians,
             oracle,
-            custodian,
             address(controller),
             address(weth),
             address(custos),
