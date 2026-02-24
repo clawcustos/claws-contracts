@@ -502,7 +502,7 @@ contract CustosMineController {
     function seedRewards(uint256 amount) external onlyCustodian {
         require(amount > 0, "zero amount");
         uint256 contractBal = IERC20(CUSTOS_TOKEN).balanceOf(address(this));
-        require(contractBal >= pendingRewards + amount, "insufficient balance — transfer first");
+        require(contractBal >= pendingRewards + amount, "insufficient balance - transfer first");
         pendingRewards += amount;
         emit CustosReceived(amount, pendingRewards);
     }
@@ -590,6 +590,10 @@ contract CustosMineController {
     function getCurrentChallenge() external view returns (Challenge memory) {
         if (challengeCount == 0) return challenges[0]; // empty
         return challenges[currentChallengeId];
+    }
+
+    function getChallenge(uint256 challengeId) external view returns (Challenge memory) {
+        return challenges[challengeId];
     }
 
     function getEpoch(uint256 epochId) external view returns (Epoch memory) {

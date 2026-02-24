@@ -4,6 +4,10 @@ pragma solidity ^0.8.25;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+interface ICustosMineController {
+    function receiveCustos(uint256 amount) external;
+}
+
 /**
  * @title CustosMineRewards
  * @notice Accumulates WETH from 0xSplits R&D allocation.
@@ -105,8 +109,9 @@ contract CustosMineRewards {
         // Clear any residual approval
         IERC20(WETH).approve(ALLOWANCE_HOLDER, 0);
 
-        // Forward to controller
+        // Forward to controller and notify it for accounting
         IERC20(CUSTOS_TOKEN).safeTransfer(controller, custosReceived);
+        ICustosMineController(controller).receiveCustos(custosReceived);
 
         emit SwappedAndSent(wethBalance, custosReceived, controller);
     }
