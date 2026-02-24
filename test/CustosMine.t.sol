@@ -42,6 +42,24 @@ contract MockZeroEx {
     }
 }
 
+
+// ─── Mock CustosProxy ──────────────────────────────────────────────────────────
+
+contract MockCustosProxy {
+    mapping(uint256 => bytes32) public inscriptionContentHash;
+    mapping(uint256 => address) public inscriptionAgent;
+    mapping(address => uint256) public agentIdByWallet;
+    uint256 public nextId = 1;
+
+    /// @dev Register a fake inscription — returns inscriptionId
+    function mockInscribe(address agent, bytes32 contentHash) external returns (uint256 id) {
+        id = nextId++;
+        inscriptionContentHash[id] = contentHash;
+        inscriptionAgent[id]       = agent;
+        if (agentIdByWallet[agent] == 0) agentIdByWallet[agent] = id;
+    }
+}
+
 // ─── Base test setup ───────────────────────────────────────────────────────────
 
 contract MineTestBase is Test {
@@ -57,6 +75,7 @@ contract MineTestBase is Test {
     address miner1    = makeAddr("miner1");
     address miner2    = makeAddr("miner2");
     address miner3    = makeAddr("miner3");
+    MockCustosProxy  proxy;
 
     uint256 constant T1 = 25_000_000e18;
     uint256 constant T2 = 50_000_000e18;
@@ -68,8 +87,10 @@ contract MineTestBase is Test {
         zeroEx = new MockZeroEx(custos);
 
         // Deploy controller first
+        proxy = new MockCustosProxy();
         controller = new CustosMineController(
             address(custos),
+            address(proxy),
             address(0), // custosMineRewards - set after rewards deployment
             oracle,
             T1, T2, T3
@@ -123,15 +144,29 @@ contract MineTestBase is Test {
         roundId = controller.postRound("ipfs://Qm", answerHash);
     }
 
+    /// @dev Inscribe on mock proxy then registerCommit (round 1 pattern)
     function _commit(address miner, uint256 roundId, string memory answer, bytes32 salt) internal {
-        bytes32 commitHash = keccak256(abi.encodePacked(answer, salt));
+        bytes32 ch = keccak256(abi.encodePacked(answer, salt));
         vm.prank(miner);
-        controller.commit(roundId, commitHash);
+        uint256 insId = proxy.mockInscribe(miner, ch);
+        vm.prank(miner);
+        controller.registerCommit(roundId, insId);
     }
 
+    /// @dev Inscribe + registerCommitReveal (rounds 2-139 pattern)
+    function _commitReveal(address miner, uint256 roundIdC, string memory answerC, bytes32 saltC,
+                            uint256 roundIdR, string memory answerR, bytes32 saltR) internal {
+        bytes32 ch = keccak256(abi.encodePacked(answerC, saltC));
+        vm.prank(miner);
+        uint256 insId = proxy.mockInscribe(miner, ch);
+        vm.prank(miner);
+        controller.registerCommitReveal(roundIdC, insId, roundIdR, answerR, saltR);
+    }
+
+    /// @dev registerReveal only (round 140 pattern)
     function _reveal(address miner, uint256 roundId, string memory answer, bytes32 salt) internal {
         vm.prank(miner);
-        controller.reveal(roundId, answer, salt);
+        controller.registerReveal(roundId, answer, salt);
     }
 
     function _settleRound(uint256 roundId, string memory answer) internal {
@@ -184,7 +219,7 @@ contract MineControllerEpochTest is MineTestBase {
     function test_openEpoch_revertsIfAlreadyOpen() public {
         _openEpoch();
         vm.prank(oracle);
-        vm.expectRevert("Epoch already open");
+        vm.expectRevert(bytes("E11"));
         controller.openEpoch(0);
     }
 
@@ -198,7 +233,7 @@ contract MineControllerEpochTest is MineTestBase {
 
     function test_closeEpoch_revertsIfNoActiveEpoch() public {
         vm.prank(oracle);
-        vm.expectRevert("No epoch open");
+        vm.expectRevert(bytes("E10"));
         controller.closeEpoch();
     }
 
@@ -243,7 +278,7 @@ contract MineControllerStakingTest is MineTestBase {
     function test_stake_revertsBelowTier1() public {
         custos.mint(miner1, T1 - 1);
         vm.prank(miner1);
-        vm.expectRevert("Amount below tier1");
+        vm.expectRevert(bytes("E13"));
         controller.stake(T1 - 1);
     }
 
@@ -365,34 +400,40 @@ contract MineControllerCommitRevealTest is MineTestBase {
         assertEq(rnd.answerHash, ah);
         assertEq(rnd.epochId, 1);
         assertFalse(rnd.settled);
-        assertTrue(controller.isCommitOpen());
+        { CustosMineController.Round memory r2 = controller.getCurrentRound(); assertTrue(block.timestamp >= r2.commitOpenAt && block.timestamp < r2.commitCloseAt); }
     }
 
     function test_commit_succeeds() public {
         (uint256 rid,) = _postRound(ANSWER);
         _commit(miner1, rid, ANSWER, SALT);
-        
-        (bytes32 commitHash,, bool committed, bool revealed, bool credited, uint256 tierAtCommit) = 
-            controller.submissions(rid, miner1);
-        assertTrue(committed);
-        assertEq(commitHash, keccak256(abi.encodePacked(ANSWER, SALT)));
-        assertEq(tierAtCommit, 1); // miner1 has tier 1
+
+        CustosMineController.Submission memory sub = controller.getSubmission(rid, miner1);
+        assertTrue(sub.committed);
+        // contentHash on proxy should match keccak256(answer|salt)
+        bytes32 expected = keccak256(abi.encodePacked(ANSWER, SALT));
+        assertEq(proxy.inscriptionContentHash(sub.commitInscriptionId), expected);
     }
 
     function test_commit_revertsNotStaked() public {
         (uint256 rid,) = _postRound(ANSWER);
-        vm.prank(makeAddr("unregistered"));
-        vm.expectRevert("Not staked for epoch");
-        controller.commit(rid, bytes32(uint256(1)));
+        address unregistered = makeAddr("unregistered");
+        bytes32 ch = keccak256(abi.encodePacked("answer", bytes32("salt")));
+        uint256 insId = proxy.mockInscribe(unregistered, ch);
+        vm.prank(unregistered);
+        vm.expectRevert(bytes("E12"));
+        controller.registerCommit(rid, insId);
     }
 
     function test_commit_revertsAfterWindow() public {
         (uint256 rid,) = _postRound(ANSWER);
         CustosMineController.Round memory rnd = controller.getCurrentRound();
+        // inscribe before warp so inscription exists, then warp past commit window
+        bytes32 ch = keccak256(abi.encodePacked(ANSWER, SALT));
+        uint256 insId = proxy.mockInscribe(miner1, ch);
         vm.warp(rnd.commitCloseAt + 1);
         vm.prank(miner1);
-        vm.expectRevert("Commit closed");
-        controller.commit(rid, bytes32(uint256(1)));
+        vm.expectRevert(bytes("E62"));
+        controller.registerCommit(rid, insId);
     }
 
     function test_reveal_succeeds() public {
@@ -401,10 +442,10 @@ contract MineControllerCommitRevealTest is MineTestBase {
         CustosMineController.Round memory rnd = controller.getCurrentRound();
         vm.warp(rnd.commitCloseAt + 1);
         _reveal(miner1, rid, ANSWER, SALT);
-        
-        (,, bool committed, bool revealed,,) = controller.submissions(rid, miner1);
-        assertTrue(committed);
-        assertTrue(revealed);
+
+        CustosMineController.Submission memory sub = controller.getSubmission(rid, miner1);
+        assertTrue(sub.committed);
+        assertTrue(sub.revealed);
     }
 
     function test_reveal_revertsWrongSalt() public {
@@ -413,8 +454,8 @@ contract MineControllerCommitRevealTest is MineTestBase {
         CustosMineController.Round memory rnd = controller.getCurrentRound();
         vm.warp(rnd.commitCloseAt + 1);
         vm.prank(miner1);
-        vm.expectRevert("Hash mismatch");
-        controller.reveal(rid, ANSWER, keccak256("wrong-salt"));
+        vm.expectRevert(bytes("E17"));
+        controller.registerReveal(rid, ANSWER, keccak256("wrong-salt"));
     }
 
     function test_settle_awardsCreditsCorrectly() public {
@@ -447,18 +488,19 @@ contract MineControllerCommitRevealTest is MineTestBase {
         (uint256 rid,) = _postRound(ANSWER);
         _settleRound(rid, ANSWER);
         vm.prank(oracle);
-        vm.expectRevert("Already settled");
+        vm.expectRevert(bytes("E40"));
         controller.settleRound(rid, ANSWER);
     }
 
     function test_expireRound_succeeds() public {
         (uint256 rid,) = _postRound(ANSWER);
         CustosMineController.Round memory rnd = controller.getCurrentRound();
-        vm.warp(rnd.revealCloseAt + 1);
+        // expireRound requires block.timestamp > revealCloseAt + 300
+        vm.warp(rnd.revealCloseAt + 301);
         
         controller.expireRound(rid);
         
-        CustosMineController.Round memory r = controller.getCurrentRound();
+        CustosMineController.Round memory r = controller.getRound(rid);
         assertTrue(r.expired);
     }
 }
@@ -518,14 +560,14 @@ contract MineControllerClaimTest is MineTestBase {
         vm.prank(miner1);
         controller.claimEpochReward(1);
         vm.prank(miner1);
-        vm.expectRevert("Already claimed");
+        vm.expectRevert(bytes("E21"));
         controller.claimEpochReward(1);
     }
 
     function test_claim_revertsNoCredits() public {
         // miner3 never participated
         vm.prank(miner3);
-        vm.expectRevert("No credits");
+        vm.expectRevert(bytes("E23"));
         controller.claimEpochReward(1);
     }
 
@@ -533,7 +575,7 @@ contract MineControllerClaimTest is MineTestBase {
         CustosMineController.Epoch memory e = controller.getEpoch(1);
         vm.warp(e.endAt + 30 days + 1);
         vm.prank(miner1);
-        vm.expectRevert("Claim deadline passed");
+        vm.expectRevert(bytes("E22"));
         controller.claimEpochReward(1);
     }
 
@@ -549,17 +591,13 @@ contract MineControllerClaimTest is MineTestBase {
         vm.prank(oracle);
         rid = controller.postRound("ipfs://test", ah);
 
-        vm.prank(miner1);
-        controller.commit(rid, keccak256(abi.encodePacked(ANSWER, SALT1)));
-        vm.prank(miner2);
-        controller.commit(rid, keccak256(abi.encodePacked(ANSWER, SALT2)));
+        _commit(miner1, rid, ANSWER, SALT1);
+        _commit(miner2, rid, ANSWER, SALT2);
 
         CustosMineController.Round memory rnd = controller.getCurrentRound();
         vm.warp(rnd.commitCloseAt + 1);
-        vm.prank(miner1);
-        controller.reveal(rid, ANSWER, SALT1);
-        vm.prank(miner2);
-        controller.reveal(rid, ANSWER, SALT2);
+        _reveal(miner1, rid, ANSWER, SALT1);
+        _reveal(miner2, rid, ANSWER, SALT2);
 
         vm.warp(rnd.revealCloseAt + 1);
         vm.prank(oracle);
@@ -584,12 +622,12 @@ contract MineControllerSeedTest is MineTestBase {
 
     function test_seedRewards_revertsInsufficientBalance() public {
         vm.prank(custodian);
-        vm.expectRevert("Insufficient balance");
+        vm.expectRevert(bytes("E48"));
         controller.seedRewards(1e18);
     }
 
     function test_receiveCustos_onlyFromRewardsContract() public {
-        vm.expectRevert("Only rewards contract");
+        vm.expectRevert(bytes("E44"));
         controller.receiveCustos(1e18);
     }
 
@@ -618,7 +656,7 @@ contract MineControllerRecoveryTest is MineTestBase {
 
     function test_recoverERC20_revertsNonCustodian() public {
         vm.prank(makeAddr("random"));
-        vm.expectRevert("Not custodian");
+        vm.expectRevert(bytes("E25"));
         controller.recoverERC20(address(custos), 1, custodian);
     }
 }
@@ -652,7 +690,7 @@ contract MineControllerConfigTest is MineTestBase {
 
         custos.mint(makeAddr("p"), T1);
         vm.prank(makeAddr("p"));
-        vm.expectRevert("Paused");
+        vm.expectRevert(bytes("E27"));
         controller.stake(T1);
     }
 }
@@ -719,7 +757,7 @@ contract MineControllerSecurityTest is MineTestBase {
 
         // Try to withdraw immediately — epoch still open
         vm.prank(miner1);
-        vm.expectRevert("Epoch not ended");
+        vm.expectRevert(bytes("E39"));
         controller.withdrawStake();
     }
 
@@ -748,7 +786,7 @@ contract MineControllerSecurityTest is MineTestBase {
         controller.seedRewards(amt);
         // pendingRewards = amt, balance = amt. No free balance left.
         vm.prank(custodian);
-        vm.expectRevert("Insufficient balance");
+        vm.expectRevert(bytes("E48"));
         controller.seedRewards(1); // nothing left to seed
     }
 
@@ -757,11 +795,12 @@ contract MineControllerSecurityTest is MineTestBase {
         // Deploy a fresh controller with address(0) as rewardsAddress
         CustosMineController fresh = new CustosMineController(
             address(custos),
-            address(0), // not set
+            address(proxy),
+            address(0), // rewards not set
             oracle,
             T1, T2, T3
         );
-        vm.expectRevert("Rewards not set");
+        vm.expectRevert(bytes("E29"));
         fresh.receiveCustos(100e18);
     }
 
@@ -781,8 +820,9 @@ contract MineControllerSecurityTest is MineTestBase {
         // Try to commit to epoch-1 round during epoch 2
         bytes32 ch = keccak256(abi.encodePacked("answer", bytes32("salt")));
         vm.prank(miner1);
-        vm.expectRevert("Round not in current epoch");
-        controller.commit(rid, ch);
+        uint256 insId = proxy.mockInscribe(miner1, ch);
+        vm.expectRevert(bytes("E58"));
+        controller.registerCommit(rid, insId);
     }
 
     // FIX5: settleRound should revert with wrong answer (not matching answerHash)
@@ -797,7 +837,7 @@ contract MineControllerSecurityTest is MineTestBase {
         vm.warp(rnd.revealCloseAt + 1);
 
         vm.prank(oracle);
-        vm.expectRevert("Answer mismatch");
+        vm.expectRevert(bytes("E17"));
         controller.settleRound(rid, "wrong_answer");
     }
 
@@ -813,7 +853,7 @@ contract MineControllerSecurityTest is MineTestBase {
         vm.warp(rnd.revealCloseAt + 1);
 
         vm.prank(oracle);
-        vm.expectRevert("Answer mismatch");
+        vm.expectRevert(bytes("E17"));
         controller.settleBatch(rid, 0, 0, "wrong_answer");
     }
 
@@ -843,7 +883,7 @@ contract MineControllerSecurityTest is MineTestBase {
 
         // Now settleRound should revert because batchSettling is in progress
         vm.prank(oracle);
-        vm.expectRevert("Batch settle in progress");
+        vm.expectRevert(bytes("E52"));
         controller.settleRound(rid, "correct");
     }
 
@@ -853,7 +893,7 @@ contract MineControllerSecurityTest is MineTestBase {
 
         // No extra CUSTOS in contract — all is staked
         vm.prank(custodian);
-        vm.expectRevert("Insufficient available");
+        vm.expectRevert(bytes("E48"));
         controller.recoverERC20(address(custos), 1, custodian);
     }
 
