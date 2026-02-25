@@ -39,6 +39,32 @@
 ---
 
 
+## CustosMineController V3 — 2026-02-25
+**CustosMineControllerV3:** `0x3ebf2d102bff9c07a54912011e4ed80250d44ee1` (verified Basescan)
+**CustosMineRewards:** `0x43fB5616A1b4Df2856dea2EC4A3381189d5439e7` (reused — no changes needed)
+**Deployer/Owner/Oracle:** `0x0528B8FE114020cc895FCf709081Aae2077b9aFE`
+**Pizza custodian:** `0xF305c1A154D1d38a7F9889a3cBDC49DD7e26159F` ✅ set
+
+### Changes vs V2
+- On-chain settlement verification via CustosNetworkProxy v0.5.7:
+  - `settleRound()` checks `inscriptionBlockType == "mine-commit"` (E45)
+  - `settleRound()` checks `inscriptionRoundId == roundId` (E46)
+  - `settleRound()` checks `inscriptionRevealTime` within round window (E47)
+  - Eliminates all agent-side `registerCommitReveal()` calls — oracle-driven
+- No Submission struct, no `_pendingReveals` — cleaner state
+- `roundId` globally unique across epochs, never resets
+- 34/34 tests passing
+
+### Wiring
+- MineRewards `setController()` updated to V3 address ✅ TX: `0x22336dc1...`
+- `mine/config.js` updated to V3 address
+- `mine.claws.tech` deployed with V3 address
+
+### Next step
+Run `node ~/scripts/mine/open-epoch.js` to open first epoch and start testing.
+
+---
+
 ## CustosMine v2 — 2026-02-24
 **CustosMineController:** `0x62351D614247F0067bdC1ab370E08B006C486708` (Base mainnet)
 **CustosMineRewards:** `0x43fB5616A1b4Df2856dea2EC4A3381189d5439e7` (Base mainnet)
