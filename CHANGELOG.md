@@ -1,5 +1,44 @@
 # CustosNetwork Contract Changelog
 
+## v0.5.7 — 2026-02-25
+**Implementation:** `0x1f0ac94875870751d6f7e6e7e13bb2494ca6bd2e` (verified Basescan)
+**Previous (deprecated, never activated):** `0xcF2c9c3B1d5541aCF2bC82fDE8CB0C2987E5f037`
+**Proxy:** `0x9B5FD0B02355E954F159F33D7886e4198ee777b9` (unchanged)
+**Source:** `src/CustosNetworkProxyV057.sol`
+**Custos proposeUpgrade tx:** `0x6bc5533345c5ec9bad2bd28cf3bb92d40774ae0c1225b007761d70c0104ebcf6`
+**Status:** Awaiting Pizza `proposeUpgrade(0x1f0ac94875870751d6f7e6e7e13bb2494ca6bd2e)` then either custodian calls `confirmUpgrade(0x1f0ac94875870751d6f7e6e7e13bb2494ca6bd2e)`
+
+### Changes vs v0.5.6
+- **inscriptionBlockType** (slot 38): stores `blockType` string at inscription time. Enables `CustosMineControllerV3` to verify `"mine-commit"` type on-chain in `settleRound()`.
+- **inscriptionRevealTime** (slot 39): stores `block.timestamp` when `reveal()` is called. Enables MineController to verify reveal happened within the round's reveal window.
+- **inscriptionRoundId** (slot 40): stores `roundId` at inscription time (0 for non-mine inscriptions). `roundId` is globally unique across epochs — never resets. Enables unambiguous round linkage.
+- **`inscribe()` gains `uint256 roundId` param**: pass `0` for regular non-mine inscriptions.
+- **`depositBuyback(uint256 amount)`**: open deposit into `buybackPool`. Anyone can top up. `safeTransferFrom` → `buybackPool += amount`. Emits `BuybackDeposited(sender, amount)`. Enables manual seeding without inscription flow.
+- **`initializeV057()`**: `reinitializer(7)`, no state migrations needed. Slots 38–40 default to zero.
+- `executeBuyback()` unchanged: swap stays in contract, output sent to `ECOSYSTEM_WALLET`. Confirmed working at ~707k gas (Uniswap V4 multi-hop). Recommended gas limit: 900k.
+
+### Storage (appended to v0.5.6 slots)
+| Slot | Field | Type | Notes |
+|---|---|---|---|
+| 38 | inscriptionBlockType | mapping(uint256 => string) | Set at `inscribe()` |
+| 39 | inscriptionRevealTime | mapping(uint256 => uint256) | Set at `reveal()` |
+| 40 | inscriptionRoundId | mapping(uint256 => uint256) | Set at `inscribe()` if `roundId != 0` |
+
+### Events
+- `BuybackDeposited(address indexed sender, uint256 amount)` — emitted on `depositBuyback()`
+
+### Tests
+- 22/22 passing (`test/CustosNetworkProxyV057.t.sol`)
+- New: `test_DepositBuybackIncreasesBuybackPool`, `test_DepositBuybackTransfersUSDCToContract`, `test_DepositBuybackEmitsEvent`, `test_DepositBuybackRevertsOnZero`, `test_DepositBuybackOpenToAnyone`
+
+### Activation steps
+1. Pizza: `cast send 0x9B5FD0B02355E954F159F33D7886e4198ee777b9 "proposeUpgrade(address)" 0x1f0ac94875870751d6f7e6e7e13bb2494ca6bd2e --private-key <PIZZA_KEY> --rpc-url https://mainnet.base.org`
+2. Either custodian: `cast send 0x9B5FD0B02355E954F159F33D7886e4198ee777b9 "confirmUpgrade(address)" 0x1f0ac94875870751d6f7e6e7e13bb2494ca6bd2e --private-key <KEY> --rpc-url https://mainnet.base.org`
+3. Verify: `cast call 0x9B5FD0B02355E954F159F33D7886e4198ee777b9 "inscriptionBlockType(uint256)" 1 --rpc-url https://mainnet.base.org` — should return a string (not revert)
+
+---
+
+
 ## CustosMine v2 — 2026-02-24
 **CustosMineController:** `0x62351D614247F0067bdC1ab370E08B006C486708` (Base mainnet)
 **CustosMineRewards:** `0x43fB5616A1b4Df2856dea2EC4A3381189d5439e7` (Base mainnet)

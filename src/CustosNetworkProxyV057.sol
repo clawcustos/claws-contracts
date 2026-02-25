@@ -23,6 +23,8 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
  *   - inscriptionRoundId (slot 40): stores roundId at inscription time (0 for non-mine inscriptions)
  *     Enables unambiguous round linkage across epochs — roundId is globally unique, never resets
  *   - inscribe() gains uint256 roundId param (pass 0 for regular non-mine inscriptions)
+ *   - depositBuyback(uint256 amount): open deposit into buybackPool. Anyone can top up.
+ *     Useful for manual seeding without going through the protocol inscription flow.
  *   - initializeV057(): reinitializer(7), no state migrations needed
  *
  * Architecture:
@@ -186,6 +188,7 @@ contract CustosNetworkProxyV057 is
     event ValidatorApproved(uint256 indexed agentId, address indexed wallet);
     event ValidatorRemoved(uint256 indexed agentId, address indexed wallet, string reason, bool stakeReturned);
     event ValidatorSlashed(address indexed validator, bytes32 indexed proofHash, address indexed reporter, uint256 amount);
+    event BuybackDeposited(address indexed sender, uint256 amount);
     event BuybackExecuted(uint256 usdcSpent, uint256 custosReceived);
     event GenesisSet(uint256 indexed agentId, bytes32 chainHead, uint256 cycleCount);
     event UpgradeProposed(address indexed custodian, address indexed newImpl);
@@ -659,8 +662,22 @@ contract CustosNetworkProxyV057 is
     // ─── Buyback ─────────────────────────────────────────────────────────────
 
     /**
+     * @notice Deposit USDC directly into the buyback pool. Open to anyone.
+     *         Useful for manual seeding or protocol-level contributions.
+     * @param amount USDC amount (6 decimals) to add to buybackPool.
+     */
+    function depositBuyback(uint256 amount) external nonReentrant {
+        require(amount > 0, "E11");
+        IERC20(USDC).safeTransferFrom(msg.sender, address(this), amount);
+        buybackPool += amount;
+        emit BuybackDeposited(msg.sender, amount);
+    }
+
+    /**
      * @notice Execute a USDC → $CUSTOS buyback using 0x allowance-holder.
      *         Bought $CUSTOS sent to ecosystem wallet — NOT burned.
+     *         Use 0x /swap/allowance-holder/quote to get swapTarget + swapData.
+     *         Gas requirement: ~900k (Uniswap V4 multi-hop).
      * @param usdcAmount   Amount from buybackPool to spend.
      * @param swapTarget   Must be ALLOWANCE_HOLDER (0x0000...1ff3).
      * @param swapData     Calldata from 0x /swap/allowance-holder/quote.
