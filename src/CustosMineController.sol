@@ -760,7 +760,7 @@ contract CustosMineController {
     // ============ View ============
 
     function getCurrentRound() external view returns (Round memory) {
-        if (roundCount == 0) return Round(0,0,0,0,0,bytes32(0),"",false,false,false,"",0,0);
+        if (roundCount == 0) return Round({ roundId: 0, epochId: 0, commitOpenAt: 0, commitCloseAt: 0, revealCloseAt: 0, answerHash: bytes32(0), questionUri: "", settled: false, expired: false, batchSettling: false, revealedAnswer: "", correctCount: 0, revealCount: 0 });
         return rounds[roundCount];
     }
     function getRound(uint256 roundId)   external view returns (Round memory)  { return rounds[roundId]; }

@@ -1273,17 +1273,19 @@ contract ClawsFarcasterTest is Test {
     function test_VerifyRevertsExpiredSignature() public {
         claws.createMarket(FID1, HANDLE);
         
-        uint256 timestamp = block.timestamp;
+        // Use a fixed timestamp so via_ir optimizer cannot substitute block.timestamp at use sites
+        uint256 signedAt = 1000;
+        vm.warp(signedAt);
         uint256 nonce = 12345;
         
-        bytes memory signature = _signVerification(FID1, agentWallet, timestamp, nonce);
+        bytes memory signature = _signVerification(FID1, agentWallet, signedAt, nonce);
         
         // Warp forward 2 hours (past the 1-hour expiry)
-        vm.warp(block.timestamp + 7200);
+        vm.warp(signedAt + 7200);
         
         vm.prank(agentWallet);
         vm.expectRevert(Claws.SignatureExpired.selector);
-        claws.verifyAndClaim(FID1, agentWallet, timestamp, nonce, signature);
+        claws.verifyAndClaim(FID1, agentWallet, signedAt, nonce, signature);
     }
     
     // ============ Whitelist Tier System ============
