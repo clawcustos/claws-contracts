@@ -1,5 +1,40 @@
 # CustosNetwork Contract Changelog
 
+## CustosMineRewardsV051 — 2026-02-26
+**Contract:** `0x49593d90e3279a829436a46cd9f213e1a89836b4` (Base mainnet)
+**Source:** `src/CustosMineRewardsV051.sol` (contract: `CustosMineRewardsV051`)
+**VERSION():** `"v0.5.1"`
+**Deploy tx:** `0xe56cbb153e3d639e3c4ef91534ad18b140a8ccc74627b5ae7d61e105aa6fda55`
+**Deployer/Owner:** `0x0528B8FE114020cc895FCf709081Aae2077b9aFE`
+**Custodians:** Custos MM (`0x0528...`) + Pizza (`0xF305...`)
+**Oracle:** `0x19eE9D68cA11Fcf3Db49146b88cAE6E746E67F96`
+**Controller:** `0xe818445e8A04fEC223b0e8B2f47139C42D157099` (CustosMineControllerV051)
+**Status:** LIVE — wired to controller via `setCustosMineRewards()` ✅
+
+### Changes vs previous deployments (0x43fB, 0x34A281)
+- **VERSION constant:** `string public constant VERSION = "v0.5.1"` — on-chain version identification
+- **Proper naming:** `CustosMineRewardsV051` matches controller naming convention
+- **WethReceived event:** emitted on `receiveWeth()` for full event traceability
+- **Natdoc comments:** full NatDoc on all functions, clear flow documentation
+- **Deploy script:** `script/DeployMineRewardsV051.s.sol` — reproducible deployment
+
+### Previous MineRewards deployments (deprecated)
+- `0x43fB5616A1b4Df2856dea2EC4A3381189d5439e7` — v2 era, no VERSION, controller=old V3
+- `0x34A281e18F6e71061cC1832941DAb3E62e19f460` — unversioned, source not tracked in repo
+
+### Wiring
+- `controller.setCustosMineRewards(0x4959...)` ✅ TX: `0x6e965d3c...`
+- Update 0xSplits R&D recipient to `0x49593d90e3279a829436a46cd9f213e1a89836b4` (Pizza action)
+
+### Flow
+```
+0xSplits R&D → WETH → receiveWeth()/direct transfer → swapAndSend(calldata, minOut)
+  → 0x AllowanceHolder swap → $CUSTOS → controller.receiveCustos() → rewardBuffer
+  → next openEpoch() → epoch prize pool
+```
+
+---
+
 ## v0.5.7 — 2026-02-25
 **Implementation:** `0x1f0ac94875870751d6f7e6e7e13bb2494ca6bd2e` (verified Basescan)
 **Previous (deprecated, never activated):** `0xcF2c9c3B1d5541aCF2bC82fDE8CB0C2987E5f037`
