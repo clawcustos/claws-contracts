@@ -280,3 +280,24 @@ Run `node ~/scripts/mine/open-epoch.js` to open first epoch and start testing.
 ### Deployment
 - Deployed by market-maker wallet `0x0528B8FE...`
 - Verified: https://basescan.org/address/0x4f59c57eb19babbdee5d5ed645feb3ec2e37c7d2
+
+---
+
+## MineController v0.5.1 (corrected) — 2026-02-26
+**Contract:** `0xe818445e8a04fec223b0e8b2f47139c42d157099` (verified Basescan)
+**Source:** `src/CustosMineControllerV051.sol` (contract: `CustosMineControllerV051`)
+**VERSION():** `"v0.5.1"`
+**Replaces:** `0x4F59C57eB19BabBdEe5D5ED645FEB3EC2e37C7D2` (bad deploy — named `CustosMineControllerV5`, stake locked, pending Pizza unlock)
+**Status:** READY — awaiting stake migration once 0x4F59C57e is unlocked
+
+### Changes vs v0.5.0
+- **Mid-epoch staking:** `stake()` auto-writes `tierSnapshot[epochId][msg.sender]` immediately if epoch open + snapshot complete
+- **VERSION constant:** `string public constant VERSION = "v0.5.1"`
+- **Correct naming:** `CustosMineControllerV051` (not V5)
+
+### Activation steps (Pizza required)
+1. On `0x4F59C57e`: `openEpoch()` → `snapshotBatch(n)` → `closeEpoch()` → `accumulateCreditsBatch(n)` → `finalizeClose()` — unlocks market-maker stake
+2. Market-maker: `withdrawStake()` on `0x4F59C57e`
+3. Market-maker: `approve(0xe818..., 25_000_000e18)` + `stake(25_000_000e18)` on `0xe818...`
+4. Pizza: `openEpoch()` + `snapshotBatch(n)` on `0xe818...`
+5. Re-enable oracle + agent crons pointing to `0xe818...`
