@@ -260,3 +260,23 @@ Run `node ~/scripts/mine/open-epoch.js` to open first epoch and start testing.
 ### Notes
 - V5.5 was never confirmed on-chain (Pizza never ran confirmUpgrade) — v0.5.6 supersedes it
 - V5.5 commit `da30f66` preserved in history; v0.5.6 builds cleanly on top
+
+---
+
+## MineController v0.5.1 — 2026-02-26
+**Contract:** `0x4F59C57eB19BabBdEe5D5ED645FEB3EC2e37C7D2` (verified Basescan)
+**Previous:** `0xd90C5266077254E607B0908be092aB9aCe70323a` (V5.0 — deprecated)
+**Source:** `src/CustosMineControllerV5.sol`
+**Status:** LIVE — active oracle, frontend, and monitor all updated
+
+### Changes vs v0.5.0
+- **Mid-epoch staking:** `stake()` now auto-writes `tierSnapshot[epochId][msg.sender]` immediately if called while epoch is open and `snapshotComplete = true`. New stakers earn credits from the very next settled round — no waiting for next epoch.
+- Unstake / withdrawal flow unchanged.
+
+### Tests
+- 35/35 passing (`test/CustosMineControllerV5.t.sol`)
+- 2 new tests covering mid-epoch stake behaviour
+
+### Deployment
+- Deployed by market-maker wallet `0x0528B8FE...`
+- Verified: https://basescan.org/address/0x4f59c57eb19babbdee5d5ed645feb3ec2e37c7d2
