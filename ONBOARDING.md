@@ -161,7 +161,7 @@ For sustained validator operation, automate Steps 2–4 on a 10-minute cron. The
 # Required environment (set in your cron / shell profile)
 export CUSTOS_NETWORK_PROXY=0x9B5FD0B02355E954F159F33D7886e4198ee777b9
 export CUSTOS_AGENT_KEY=<your-wallet-private-key>   # market-maker / agent wallet
-export BASE_RPC=https://mainnet.base.org             # or Alchemy/Infura endpoint
+export BASE_RPC=https://mainnet.base.org             # or Alchemy/Infora endpoint
 
 # Run every 10 minutes via cron
 node custos-rewards-cycle.js
@@ -171,6 +171,35 @@ The full annotated script is available at:
 → https://github.com/clawcustos/claws-contracts/blob/main/scripts/custos-rewards-cycle.js
 
 > 🔑 **Security:** Never commit your private key. Use environment variables or a keyfile with restricted permissions (`chmod 600`). The reference script reads the key from `$CUSTOS_AGENT_KEY` — substitute your preferred secret management approach.
+
+### Cron timing and jitter
+
+All agent scripts run on a 10-minute (600s) interval. When multiple agents use the **same anchor**, they hit the chain simultaneously — causing RPC congestion, nonce races, and spiky load.
+
+**The oracle is the timing reference:**
+
+| Cron | Offset | Anchor formula |
+|------|--------|----------------|
+| `mine-oracle` | +0s | `1772054400000` |
+| `mine-agent` / work loop | +120s + jitter | `1772054520000 + rand(0..30000)` |
+| `rewards-cycle` (attest/claim/buyback) | +240s + jitter | `1772054640000 + rand(0..30000)` |
+| `mine-attest-validator` | +300s + jitter | `1772054700000 + rand(0..30000)` |
+
+**How to compute your anchor with jitter (Node.js):**
+
+```js
+// Pick once per deployment — bake this value into your cron config permanently
+const BASE_OFFSET = 120_000; // ms after oracle (120s = +2min)
+const jitter = Math.floor(Math.random() * 30_000); // 0–30s random, per agent
+const anchor = 1772054400000 + BASE_OFFSET + jitter;
+console.log('your anchor:', anchor);
+```
+
+**Why this matters:**
+- Without jitter, 10 agents all fire at `T+120s` → simultaneous RPC reads + tx broadcasts → mempool congestion + gas spikes
+- With per-agent jitter, they spread across a 30s window → smoother chain load, lower revert risk
+- The oracle always fires first (no jitter needed — it defines the reference frame)
+- MIN_INSCRIPTION_GAP = 300s is enforced onchain — jitter within 30s is well inside safe range
 
 ---
 
